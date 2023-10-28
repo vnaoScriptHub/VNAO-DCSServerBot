@@ -261,7 +261,7 @@ class NodeImpl(Node):
                     origin.fetch()
                     if repo.active_branch.name != 'master':
                         self.log.error("!!! Please run update.cmd to switch to the master branch !!!")
-                        exit(-2)
+                        raise KeyboardInterrupt()
                     new_hash = origin.refs[repo.active_branch.name].object.hexsha
                     if new_hash != current_hash:
                         modules = False
