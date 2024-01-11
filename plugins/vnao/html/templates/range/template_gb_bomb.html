@@ -1,0 +1,40 @@
+<head>
+    <link rel="stylesheet" type="text/css" href="style_bomb.css"/>
+</head>
+<body>
+    <table class="table-row rangeboard-bomb">
+        <thead class="table-header">
+            <tr>
+                <td class="table-header-pilot">PILOT</td>
+                <td class="table-header-avg">AVG</td>
+                <td class="table-header-pass" colspan="30">{{ board_meta.name }}</td>
+            </tr>
+        </thead>
+        <tbody class="row-data">
+            {% for pilot in pilots %}
+            <tr>
+                <td class="row-data-pilot">{{ pilot.name }}</td>
+                <td class="row-data-avg">{{ pilot.points }}</td>
+                {% for bomb in pilot.bombs %}
+                {% if bomb.color_background != '' %}
+                <td class="row-data-pass" bgcolor="{{ bomb.color_background }}">{{ bomb.icon }}</td>
+                {% else %}
+                <td class="row-data-pass">{{ bomb.icon }}</td>
+                {% endif %}
+                {% endfor %}
+
+                <!-- Need to add the remaing columns with blank data to fill in the row with a total
+                of 30 trap columns -->
+                {% for i in range(pilot.bombs|length, 30) %}
+                <td class="row-data-pass"></td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+
+            <!-- Need to add table footer that includes a legend for trap colors/icons -->
+            <tr>
+                <td class='row-data-legend' colspan="32">{{ legend }}</td>
+            </tr>
+        </tbody>
+    </table>
+</body>

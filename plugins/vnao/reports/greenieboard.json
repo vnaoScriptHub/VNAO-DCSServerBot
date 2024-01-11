@@ -1,0 +1,10 @@
+{
+  "color": "green",
+  "elements":
+  [
+    {
+      "class": "plugins.vnao.reports.Greenie"
+    }
+  ]
+}
+  

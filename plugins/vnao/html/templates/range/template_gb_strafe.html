@@ -1,0 +1,40 @@
+<head>
+    <link rel="stylesheet" type="text/css" href="style_strafe.css"/>
+</head>
+<body>
+    <table class="table-row rangeboard-strafe">
+        <thead class="table-header">
+            <tr>
+                <td class="table-header-pilot">PILOT</td>
+                <td class="table-header-avg">AVG</td>
+                <td class="table-header-pass" colspan="30">{{ board_meta.name }}</td>
+            </tr>
+        </thead>
+        <tbody class="row-data">
+            {% for pilot in pilots %}
+            <tr>
+                <td class="row-data-pilot">{{ pilot.name }}</td>
+                <td class="row-data-avg">{{ pilot.points }}</td>
+                {% for strafe in pilot.strafes %}
+                {% if strafe.color_background != '' %}
+                <td class="row-data-trap" bgcolor="{{ strafe.color_background }}">{{ strafe.icon }}</td>
+                {% else %}
+                <td class="row-data-trap">{{ strafe.icon }}</td>
+                {% endif %}
+                {% endfor %}
+
+                <!-- Need to add the remaing columns with blank data to fill in the row with a total
+                of 30 trap columns -->
+                {% for i in range(pilot.strafes|length, 30) %}
+                <td class="row-data-trap"></td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+
+            <!-- Need to add table footer that includes a legend for trap colors/icons -->
+            <tr>
+                <td class='row-data-legend' colspan="32">{{ legend }}</td>
+            </tr>
+        </tbody>
+    </table>
+</body>

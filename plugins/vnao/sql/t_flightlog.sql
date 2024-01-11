@@ -1,0 +1,7 @@
+CREATE TABLE IF NOT EXISTS vnao_flightlogs(id uuid PRIMARY KEY,player_ucid text NOT NULL, mission_id integer NOT NULL,server_name text NOT NULL,flight_time numeric,aircraft_type text NOT NULL,departure_field text NOT NULL,arrival_field text NOT NULL,coalition smallint NOT NULL,touch_downs smallint NOT NULL DEFAULT 0,dead smallint NOT NULL DEFAULT 0,crashed smallint NOT NULL DEFAULT 0,ejected smallint NOT NULL DEFAULT 0,air_start smallint NOT NULL DEFAULT 0,mission_end smallint NOT NULL DEFAULT 0,departure_timestamp timestamp without time zone NOT NULL,arrival_timestamp timestamp without time zone);
+ALTER TABLE IF EXISTS vnao_flightlogs OWNER to dcsserverbot;
+CREATE INDEX IF NOT EXISTS idx_flightlogs_id ON vnao_flightlogs(id);
+CREATE TABLE IF NOT EXISTS vnao_lsogrades(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),flightlog_id uuid,player_ucid text NOT NULL, mission_id integer NOT NULL,server_name text NOT NULL,aircraft_type text NOT NULL,points smallint,grade text NOT NULL,details text,wire smallint,case_num smallint NOT NULL,wind numeric NOT NULL DEFAULT 0,time_groove numeric,carrier_name text,carrier_type text,trapsheet json,mission_timestamp timestamp without time zone, server_timestamp timestamp without time zone NOT NULL DEFAULT NOW());
+ALTER TABLE IF EXISTS vnao_lsogrades OWNER to dcsserverbot;
+CREATE INDEX IF NOT EXISTS idx_lsogrades_id ON vnao_lsogrades(id);
+CREATE INDEX IF NOT EXISTS idx_flightlog_id ON vnao_lsogrades(flightlog_id);

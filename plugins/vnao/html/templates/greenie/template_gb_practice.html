@@ -1,0 +1,43 @@
+<head>
+    <link rel="stylesheet" type="text/css" href="style_practice.css"/>
+</head>
+<body>
+    <table class="table-row greenieboard-practice">
+        <thead class="table-header">
+            <tr>
+                <td class="table-header-pilot">PILOT</td>
+                <td class="table-header-avg">AVG</td>
+                <td class="table-header-traps" colspan="30">{{ board_meta.name }}</td>
+            </tr>
+        </thead>
+        <tbody class="row-data">
+            {% for pilot in pilots %}
+            <tr>
+                <td class="row-data-pilot">{{ pilot.player_name }}</td>
+                <td class="row-data-avg">{{ pilot.avg }}</td>
+                {% for trap in pilot.traps %}
+                {% if trap.color_background != '' %}
+                <td class="row-data-trap" bgcolor="{{ trap.color_background }}">{{ trap.icon }}</td>
+                {% else %}
+                <td class="row-data-trap">{{ trap.icon }}</td>
+                {% endif %}
+                {% endfor %}
+
+                <!-- Need to add the remaing columns with blank data to fill in the row with a total
+                of 30 trap columns -->
+                {% for i in range(pilot.traps|length, 30) %}
+                <td class="row-data-trap"></td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+
+            <!-- Need to add table footer that includes a legend for trap colors/icons -->
+            <tr>
+                <td class='row-data-legend' colspan="32"></td>
+            </tr>
+            <tr>
+                <td class='row-data-legend' colspan="32">{{ legend }}</td>
+            </tr>
+        </tbody>
+    </table>
+</body>
