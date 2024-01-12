@@ -53,7 +53,7 @@ class Vnao(Plugin):
         config = self.get_config(server)
 
         # Build a practice board for each aircraft type
-        channel_id = config.get('persistent_practice_channel', server.channels[Channel.ADMIN])
+        channel_id = config.get('persistent_practice_channel', self.bot.get_admin_channel(server))
         squadron_data["is_squadron_flight"] = False
         for key, val in config['greenie_boards']["aircraft"].items():
             trap_data["airframe"] = key
@@ -64,7 +64,7 @@ class Vnao(Plugin):
             await report.render(server_name=server.name, config=config, trap_data=deepcopy(trap_data), squadron_data=deepcopy(squadron_data))
 
         # Build a squadron board for each squadron
-        channel_id = config.get('persistent_squadron_channel', server.channels[Channel.ADMIN])
+        channel_id = config.get('persistent_practice_channel', self.bot.get_admin_channel(server))
         for key, val in config['greenie_boards']["squadron_tags"].items():
             squadron_data["is_squadron_flight"] = True
             squadron_data["squadron_name"] = val["display_name"]
@@ -85,12 +85,12 @@ class Vnao(Plugin):
         config = self.get_config(server)
 
         report = PersistentReport(self.bot, self.plugin_name, "rangeboard.json", embed_name=f'bombboard-{server.name}',
-                            channel_id=config.get('persistent_range_channel', server.channels[Channel.ADMIN]),
+                            channel_id = config.get('persistent_practice_channel', self.bot.get_admin_channel(server)),
                             server=server)
         await report.render(server_name=server.name, config=config, board_type='bomb')
 
         report = PersistentReport(self.bot, self.plugin_name, "rangeboard.json", embed_name=f'strafeboard-{server.name}',
-                    channel_id=config.get('persistent_range_channel', server.channels[Channel.ADMIN]),
+                    channel_id = config.get('persistent_practice_channel', self.bot.get_admin_channel(server)),
                     server=server)
         await report.render(server_name=server.name, config=config, board_type='strafe')
 

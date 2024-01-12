@@ -15,18 +15,18 @@
             <tr>
                 <td class="row-data-pilot">{{ pilot.name }}</td>
                 <td class="row-data-avg">{{ pilot.points }}</td>
-                {% for strafe in pilot.strafes %}
-                {% if strafe.color_background != '' %}
-                <td class="row-data-trap" bgcolor="{{ strafe.color_background }}">{{ strafe.icon }}</td>
+                {% for pass in pilot.passes %}
+                {% if pass.color_background != '' %}
+                <td class="row-data-pass" bgcolor="{{ pass.color_background }}">{{ pass.icon }}</td>
                 {% else %}
-                <td class="row-data-trap">{{ strafe.icon }}</td>
+                <td class="row-data-pass">{{ pass.icon }}</td>
                 {% endif %}
                 {% endfor %}
 
                 <!-- Need to add the remaing columns with blank data to fill in the row with a total
                 of 30 trap columns -->
-                {% for i in range(pilot.strafes|length, 30) %}
-                <td class="row-data-trap"></td>
+                {% for i in range(pilot.passes|length, 30) %}
+                <td class="row-data-pass"></td>
                 {% endfor %}
             </tr>
             {% endfor %}

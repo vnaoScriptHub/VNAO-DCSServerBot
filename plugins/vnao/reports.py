@@ -293,6 +293,9 @@ class Range(EmbedElement):
                 'g, players p WHERE g.player_ucid = p.ucid AND g.rn = 1 GROUP BY 1, 2, 3 ORDER BY 3 DESC'
         sql2 += ' ORDER BY ID DESC LIMIT 30'
 
+        self.log.debug(f'SQL 1:/n{sql1}')
+        self.log.debug(f'SQL 2:/n{sql2}')
+
         with self.pool.connection() as conn:
             with closing(conn.cursor(row_factory=dict_row)) as cursor:
                 cursor.execute(sql1)
@@ -341,8 +344,8 @@ class Range(EmbedElement):
                                 case 'POOR PASS':
                                     background_color = config['range_boards']['colors']['red']
 
-                            # bomb["icon"] = icon_text
-                            # bomb["color_background"] = background_color  
+                            current_pass["icon"] = icon_text
+                            current_pass["color_background"] = background_color  
 
                         board_data.append(row)
                         # self.log.debug(board_data)
@@ -363,6 +366,7 @@ class Range(EmbedElement):
             self.log.debug(f"Temp png file: {temp_png}")
             self.log.debug(f"Temp html file: {temp_html}")
 
+            self.log.debug(f'{board_data}')
             # Generate a temp html file.
             jinja2_file_loader = jinja2.FileSystemLoader(config['range_boards']['jinja2_templates_folder'])
             jinja2_env = jinja2.Environment(loader=jinja2_file_loader)
