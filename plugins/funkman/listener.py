@@ -45,30 +45,30 @@ class FunkManEventListener(EventListener):
         theatre = self._GetVal(result, "theatre", "Unknown Map")
         theta = self._GetVal(result, "carrierrwy", -9)
 
-        color = 0x00ff00
-        urlIm = "https://i.imgur.com/1bWgcV7.png"
-        if isinstance(points, int):
+        color = 0x000000 # Grey (Should only see this with a WOFD)
+        urlIm = "https://i.imgur.com/qwGBxgt.png"
+        if type(points) != str:
             if points == 0:
-                color = 0x000000  # black
-                urlIm = "https://i.imgur.com/rZpu9c0.png"
-            elif points == 1:
                 color = 0xff0000  # red
-                urlIm = "https://i.imgur.com/LXgD2Op.png"
+                urlIm = "https://i.imgur.com/6kbbdwl.png"
+            elif points == 1:
+                color = 0x000000  # black
+                urlIm = "https://i.imgur.com/5uuGG5h.png"
             elif points == 2:
-                color = 0xFFA500  # orange
-                urlIm = "https://i.imgur.com/EjviMBk.png"
-            elif points == 2.5:
                 color = 0xB47E59  # brown
-                urlIm = "https://i.imgur.com/nYWrL4Z.png"
+                urlIm = "https://i.imgur.com/AZBCh1E.png"
+            elif points == 2.5:
+                color = 0x0000FF  # blue
+                urlIm = "https://i.imgur.com/u0PJFdt.png"
             elif points == 3:
                 color = 0xFFFF00  # yellow
-                urlIm = "https://i.imgur.com/wH0Gjqx.png"
+                urlIm = "https://i.imgur.com/R5WpdWB.png"
             elif points == 4:
                 color = 0x00FF00  # green
-                urlIm = "https://i.imgur.com/1bWgcV7.png"
+                urlIm = "https://i.imgur.com/O6RzvRY.png"
             elif points == 5:
-                color = 0x0000FF  # blue
-                urlIm = "https://i.imgur.com/6ecFSqo.png"
+                color = 0x00FF00  # green
+                urlIm = "https://i.imgur.com/O6RzvRY.png"
 
         # Create Embed
         embed = discord.Embed(title="LSO Grade",
