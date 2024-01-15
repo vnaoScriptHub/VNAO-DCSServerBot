@@ -27,7 +27,8 @@ async def mizfile_autocomplete(interaction: discord.Interaction, current: str) -
     if not utils.check_roles(interaction.client.roles['DCS Admin'], interaction.user):
         return []
     try:
-        server: Server = await ServerTransformer().transform(interaction, get_interaction_param(interaction, 'server'))
+        server: Server = await utils.ServerTransformer().transform(interaction,
+                                                                   utils.get_interaction_param(interaction, 'server'))
         if not server:
             return []
         installed_missions = [os.path.expandvars(x) for x in server.settings['missionList']]
@@ -266,7 +267,7 @@ class Mission(Plugin):
             await self.bot.audit(f'{actions.get(what)} mission', server=server, user=interaction.user)
             await msg.delete()
             await interaction.followup.send(f"Mission {actions.get(what)}.", ephemeral=ephemeral)
-        except TimeoutError:
+        except asyncio.TimeoutError:
             await interaction.followup.send(f"Timeout while {actions.get(what).replace('ed', 'ing')} the mission.\n"
                                             f"Please check with /mission info, if the server is up.",
                                             ephemeral=ephemeral)
@@ -329,7 +330,7 @@ class Mission(Plugin):
                     await self.bot.audit(f"loaded mission {utils.escape_string(name)}", server=server,
                                          user=interaction.user)
                     await interaction.followup.send(f'Mission {name} loaded.', ephemeral=ephemeral)
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     await interaction.followup.send(f'Timeout while loading mission {name}.', ephemeral=ephemeral)
                 finally:
                     await tmp.delete()
@@ -392,7 +393,7 @@ class Mission(Plugin):
                         await interaction.followup.send(f'Mission "{name}" deleted.', ephemeral=ephemeral)
                     except FileNotFoundError:
                         await interaction.followup.send(f'Mission "{name}" was already deleted.', ephemeral=ephemeral)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 await interaction.followup.send("Timeout while deleting mission.\n"
                                                 "Please reconfirm that the deletion was succesful.",
                                                 ephemeral=ephemeral)
@@ -504,7 +505,7 @@ class Mission(Plugin):
                     await self.bot.audit("changed preset {}".format(','.join(view.result)), server=server,
                                          user=interaction.user)
                     await msg.delete()
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     message = ("Timeout during restart of mission!\n"
                                "Please check, if your server is running or if the mission somehow got corrupted.")
             await interaction.followup.send(message, ephemeral=ephemeral)
@@ -861,7 +862,7 @@ class Mission(Plugin):
                 tmp = await message.channel.send(f'Loading mission {name} ...')
                 try:
                     await server.loadMission(filename)
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     await tmp.delete()
                     await message.channel.send(f"Timeout while trying to load mission.")
                     await self.bot.audit(f"Timeout while trying to load mission {name}",

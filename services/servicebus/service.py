@@ -172,8 +172,6 @@ class ServiceBus(Service):
             return
         calls = []
         for server in local_servers:
-            if server.is_remote:
-                continue
             calls.append(server.send_to_dcs_sync({"command": "registerDCSServer"}, timeout))
             if not self.master:
                 server.status = Status.UNREGISTERED
@@ -181,11 +179,11 @@ class ServiceBus(Service):
         ret = await asyncio.gather(*calls, return_exceptions=True)
         num = 0
         for i, server in enumerate(local_servers):
-            if isinstance(ret[i], TimeoutError):
+            if isinstance(ret[i], asyncio.TimeoutError):
                 self.log.debug(f'  => Timeout while trying to contact DCS server "{server.name}".')
                 server.status = Status.SHUTDOWN
             elif isinstance(ret[i], Exception):
-                self.log.exception(ret[i])
+                self.log.error("  => Exception during registering: " + str(ret[i]), exc_info=True)
             else:
                 num += 1
         if num == 0:
@@ -551,6 +549,9 @@ class ServiceBus(Service):
         class RequestHandler(BaseRequestHandler):
 
             def handle(derived):
+                if not derived.request or not derived.request[0]:
+                    self.log.warning(f"Empty request received on port {self.node.listen_port} - ignoring.")
+                    return
                 data: dict = json.loads(derived.request[0].strip())
                 # ignore messages not containing server names
                 if 'server_name' not in data:
