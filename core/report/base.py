@@ -12,7 +12,6 @@ from core import utils, Channel
 from discord import Interaction, SelectOption
 from discord.ui import View, Button, Select, Item
 from discord.utils import MISSING
-from os import path
 from typing import Tuple, Optional, TYPE_CHECKING, Any, cast, Union
 
 from .elements import ReportElement
@@ -41,9 +40,9 @@ class Report:
         self.env = ReportEnv(bot)
         default = f'./plugins/{plugin}/reports/{filename}'
         overwrite = f'./reports/{plugin}/{filename}'
-        if path.exists(overwrite):
+        if os.path.exists(overwrite):
             self.filename = overwrite
-        elif path.exists(default):
+        elif os.path.exists(default):
             self.filename = default
         else:
             raise FileNotFoundError(filename)
@@ -59,7 +58,7 @@ class Report:
         self.env.params['bot'] = self.bot
         # format the embed
         if 'color' in self.report_def:
-            self.env.embed = discord.Embed(color=getattr(discord.Color, self.report_def['color'])())
+            self.env.embed = discord.Embed(color=getattr(discord.Color, self.report_def.get('color', 'blue'))())
         else:
             self.env.embed = discord.Embed()
         for name, item in self.report_def.items():
@@ -146,7 +145,7 @@ class PaginationReport(Report):
         values = None
         if 'sql' in param:
             with self.pool.connection() as conn:
-                values = [x[0] for x in conn.execute(param['sql'], kwargs).fetchall()]
+                values = [x[0] for x in conn.execute(param['sql'], kwargs)]
         elif 'values' in param:
             values = param['values']
         elif 'obj' in param:
@@ -277,13 +276,18 @@ class PaginationReport(Report):
         func = super().render
 
         message = None
-        view = self.PaginationReportView(name, values, start_index, func, self.keep_image, *args, **kwargs)
-        env = await view.render(values[start_index])
+        if len(values) > 1:
+            view = self.PaginationReportView(name, values, start_index, func, self.keep_image, *args, **kwargs)
+            env = await view.render(values[start_index])
+        else:
+            view = None
+            kwargs[name] = values[0]
+            env = await func(*args, **kwargs)
         try:
             try:
                 message = await self.interaction.followup.send(
                     embed=env.embed,
-                    view=view,
+                    view=view or MISSING,
                     file=discord.File(fp=env.buffer or env.filename, filename=os.path.basename(env.filename)) if env.filename else MISSING
                 )
             finally:
@@ -291,7 +295,10 @@ class PaginationReport(Report):
                     if env.buffer:
                         env.buffer.close()
                     env.filename = None
-            await view.wait()
+            if view:
+                await view.wait()
+            else:
+                message = None
         except Exception as ex:
             self.log.exception(ex)
             raise
