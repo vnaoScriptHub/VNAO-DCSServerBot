@@ -45,9 +45,9 @@ class FunkManEventListener(EventListener):
         theatre = self._GetVal(result, "theatre", "Unknown Map")
         theta = self._GetVal(result, "carrierrwy", -9)
 
-        color = 0x000000 # Grey (Should only see this with a WOFD)
-        urlIm = "https://i.imgur.com/qwGBxgt.png"
-        if type(points) != str:
+        color = 0x00ff00
+        urlIm = "https://i.imgur.com/1bWgcV7.png"
+        if isinstance(points, int) or isinstance(points, float):
             if points == 0:
                 color = 0xff0000  # red
                 urlIm = "https://i.imgur.com/6kbbdwl.png"
