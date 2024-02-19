@@ -341,11 +341,11 @@ class ServerImpl(Server):
         else:
             self.log.error(f"No executable found to start a DCS server in {basepath}!")
             return
-        # check if all missions are existing
-        missions = [x for x in self.settings['missionList'] if os.path.exists(x)]
-        if len(missions) != len(self.settings['missionList']):
-            self.settings['missionList'] = missions
-            self.log.warning('Removed non-existent missions from serverSettings.lua')
+#        # check if all missions are existing
+#        missions = [x for x in self.settings['missionList'] if os.path.exists(x)]
+#        if len(missions) != len(self.settings['missionList']):
+#            self.settings['missionList'] = missions
+#            self.log.warning('Removed non-existent missions from serverSettings.lua')
         self.log.debug(r'Launching DCS server with: "{}" --server --norender -w {}'.format(path, self.instance.name))
         try:
             p = subprocess.Popen(
@@ -647,7 +647,8 @@ class ServerImpl(Server):
         else:
             missions: list[str] = self.settings['missionList']
             missions[mission_id - 1] = path
-
+            self.settings['missionList'] = missions
+    
     async def loadMission(self, mission: Union[int, str], modify_mission: Optional[bool] = True) -> None:
         if isinstance(mission, int):
             if mission > len(self.settings['missionList']):
