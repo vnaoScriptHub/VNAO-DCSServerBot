@@ -2,15 +2,12 @@ import asyncio
 import os
 
 from abc import ABC
-from contextlib import suppress, closing
+from contextlib import suppress
 from core import Server, ServiceRegistry
 from discord.ext import tasks
 from enum import Enum
 from random import randrange
-from typing import Optional, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from ..service import MusicService
+from typing import Optional
 
 # ruamel YAML support
 from ruamel.yaml import YAML
@@ -31,21 +28,25 @@ class Mode(Enum):
 class Radio(ABC):
 
     def __init__(self, name: str, server: Server):
+        from services import MusicService
+
         self.name = name
-        self.service: MusicService = ServiceRegistry.get("Music")
+        self.service = ServiceRegistry.get(MusicService)
         self.log = self.service.log
         self.pool = self.service.pool
+        self.apool = self.service.apool
         self.server = server
         self._current = None
         self._mode = Mode(int(self.config['mode']))
         self.songs: list[str] = []
         self._playlist = None
+        # TODO: async
         self.playlist = self._get_active_playlist()
         self.idx = 0 if (self._mode == Mode.REPEAT or not len(self.songs)) else randrange(len(self.songs))
 
     def _get_active_playlist(self) -> Optional[str]:
         with self.pool.connection() as conn:
-            with closing(conn.cursor()) as cursor:
+            with conn.cursor() as cursor:
                 cursor.execute('SELECT playlist_name FROM music_radios WHERE server_name = %s AND radio_name = %s',
                                (self.server.name, self.name))
                 return cursor.fetchone()[0] if cursor.rowcount > 0 else None
@@ -94,7 +95,8 @@ class Radio(ABC):
             configs[self.server.instance.name]['radios'][self.name] = config
         else:
             configs[self.server.instance.name]['radios'][self.name] |= config
-        with open(os.path.join('config', 'services', 'music.yaml'), mode='w', encoding='utf-8') as outfile:
+        with open(os.path.join(self.server.node.config_dir, 'services', 'music.yaml'), mode='w',
+                  encoding='utf-8') as outfile:
             yaml.dump(configs, outfile)
 
     def is_running(self) -> bool:

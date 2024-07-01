@@ -1,24 +1,26 @@
 import asyncio
 
-from core import ServiceRegistry, Service, DEFAULT_TAG, utils, Server
+from core import ServiceRegistry, Service, DEFAULT_TAG, utils, Server, Status
 from datetime import datetime
 from discord.ext import tasks
 from typing import Optional
 
 from . import actions
+from ..bot import BotService
+from ..servicebus import ServiceBus
 
 
-@ServiceRegistry.register("Scheduler", master_only=True, plugin="scheduler")
+@ServiceRegistry.register(plugin="scheduler")
 class SchedulerService(Service):
 
-    def __init__(self, node, name: str):
-        super().__init__(node, name)
-        self.bot = None
+    def __init__(self, node):
+        super().__init__(node=node, name="Scheduler")
+        self.bus = None
 
     async def start(self, *args, **kwargs):
         if self.locals:
             await super().start()
-            self.bot = ServiceRegistry.get("Bot").bot
+            self.bus = ServiceRegistry.get(ServiceBus)
             self.schedule.start()
 
     async def stop(self, *args, **kwargs):
@@ -30,7 +32,10 @@ class SchedulerService(Service):
         if not server:
             return self.locals.get(DEFAULT_TAG, {})
         else:
-            return self.locals.get(server.instance.name, {})
+            if self.node.name in self.locals:
+                return self.locals[self.node.name].get(server.instance.name, {})
+            else:
+                return self.locals.get(server.instance.name, {})
 
     async def do_actions(self, config: dict, server: Optional[Server] = None):
         action = config['action']
@@ -45,7 +50,7 @@ class SchedulerService(Service):
             else:
                 func(**kwargs)
         except Exception as ex:
-            self.log.exception(ex)
+            self.log.error(f"Scheduler: error while processing action {action}", exc_info=ex)
 
     @tasks.loop(minutes=1)
     async def schedule(self):
@@ -54,7 +59,8 @@ class SchedulerService(Service):
             for cfg in config['actions']:
                 if 'cron' in cfg and not utils.matches_cron(now, cfg['cron']):
                     continue
-                elif server and 'mission_time' in cfg and server.current_mission.mission_time < cfg['mission_time'] * 60:
+                elif (server and 'mission_time' in cfg and
+                      server.current_mission.mission_time < cfg['mission_time'] * 60):
                     continue
                 # noinspection PyAsyncCall
                 asyncio.create_task(self.do_actions(cfg, server))
@@ -64,7 +70,7 @@ class SchedulerService(Service):
             # run all default tasks
             await check_run(config)
             # do the servers
-            for server in self.bot.servers.values():
+            for server in [x for x in self.bus.servers.values() if not x.is_remote and x.status != Status.UNREGISTERED]:
                 config = self.get_config(server)
                 if config:
                     await check_run(config, server)
@@ -73,5 +79,6 @@ class SchedulerService(Service):
 
     @schedule.before_loop
     async def before_loop(self):
-        if self.bot:
-            await self.bot.wait_until_ready()
+        if self.node.master:
+            bot = ServiceRegistry.get(BotService).bot
+            await bot.wait_until_ready()

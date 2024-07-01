@@ -1,14 +1,16 @@
 import asyncio
 import discord
 
-from contextlib import closing
-from core import NodeImpl, ServiceRegistry, EventListener, Server, Channel, utils, Player, Status, FatalException
+from core import Channel, utils, Status, PluginError, Group
+from core.data.node import FatalException
+from core.listener import EventListener
+from core.services.registry import ServiceRegistry
 from datetime import datetime, timezone
 from discord.ext import commands
-from typing import Optional, Union, Tuple, TYPE_CHECKING, Any, Iterable
+from typing import Optional, Union, TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:
-    from ..servicebus import ServiceBus
+    from core import Server, NodeImpl
 
 __all__ = ["DCSServerBot"]
 
@@ -16,15 +18,18 @@ __all__ = ["DCSServerBot"]
 class DCSServerBot(commands.Bot):
 
     def __init__(self, *args, **kwargs):
+        from services import ServiceBus
+
         super().__init__(*args, **kwargs)
         self.version: str = kwargs['version']
         self.sub_version: str = kwargs['sub_version']
         self.node: NodeImpl = kwargs['node']
         self.pool = self.node.pool
+        self.apool = self.node.apool
         self.log = self.node.log
         self.locals = kwargs['locals']
         self.plugins = self.node.plugins
-        self.bus: ServiceBus = ServiceRegistry.get("ServiceBus")
+        self.bus = ServiceRegistry.get(ServiceBus)
         self.eventListeners: list[EventListener] = self.bus.eventListeners
         self.audit_channel = None
         self.mission_stats = None
@@ -66,7 +71,7 @@ class DCSServerBot(commands.Bot):
         return self.bus.filter
 
     @property
-    def servers(self) -> dict[str, Server]:
+    def servers(self) -> dict[str, "Server"]:
         return self.bus.servers
 
     async def setup_hook(self) -> None:
@@ -84,13 +89,17 @@ class DCSServerBot(commands.Bot):
             await self.load_extension(f'plugins.{plugin}.commands')
             return True
         except ModuleNotFoundError:
-            self.log.error(f'  - Plugin "{plugin}" not found!')
+            self.log.error(f'  - Plugin "{plugin.title()}" not found!')
         except commands.ExtensionNotFound:
-            self.log.error(f'  - No commands.py found for plugin "{plugin}"!')
+            self.log.error(f'  - No commands.py found for plugin "{plugin.title()}"!')
         except commands.ExtensionAlreadyLoaded:
-            self.log.warning(f'  - Plugin "{plugin} was already loaded"')
+            self.log.warning(f'  - Plugin "{plugin.title()} was already loaded"')
         except commands.ExtensionFailed as ex:
-            self.log.exception(ex.original if ex.original else ex)
+            if ex.original and isinstance(ex.original, PluginError):
+                self.log.error(f'  - {ex.original}')
+            else:
+                exc = ex.original if ex.original else ex
+                self.log.error(f'  - Plugin "{plugin.title()} not loaded! {exc.name}: {exc}', exc_info=True)
         except Exception as ex:
             self.log.exception(ex)
         return False
@@ -155,10 +164,10 @@ class DCSServerBot(commands.Bot):
             ret = False
         return ret
 
-    def get_channel(self, id: int, /) -> Any:
-        if id == -1:
+    def get_channel(self, channel_id: int, /) -> Any:
+        if channel_id == -1:
             return None
-        return super().get_channel(id)
+        return super().get_channel(channel_id)
 
     def get_role(self, role: Union[str, int]) -> Optional[discord.Role]:
         if isinstance(role, int):
@@ -171,7 +180,7 @@ class DCSServerBot(commands.Bot):
         else:
             return None
 
-    async def check_channels(self, server: Server):
+    async def check_channels(self, server: "Server"):
         channels = ['status', 'chat']
         if not self.locals.get('admin_channel'):
             channels.append('admin')
@@ -198,9 +207,9 @@ class DCSServerBot(commands.Bot):
                 self.member = await self.guilds[0].fetch_member(self.user.id)
                 if not self.member:
                     raise FatalException("Can't access the bots user. Check your Discord server settings.")
-                self.log.info('- Checking Roles & Channels ...')
+                self.log.debug('- Checking Roles & Channels ...')
                 roles = set()
-                for role in ['Admin', 'DCS Admin', 'DCS', 'GameMaster']:
+                for role in ['Admin', 'DCS Admin', 'Alert', 'DCS', 'GameMaster']:
                     roles |= set(self.roles[role])
                 self.check_roles(roles)
                 if self.locals.get('admin_channel'):
@@ -213,12 +222,23 @@ class DCSServerBot(commands.Bot):
                         self.check_roles(roles)
                     try:
                         await self.check_channels(server)
-                    except KeyError as ex:
+                    except KeyError:
                         self.log.error(f"Mandatory channel(s) missing for server {server.name} in servers.yaml!")
 
                 self.log.info('- Registering Discord Commands (this might take a bit) ...')
                 self.tree.copy_global_to(guild=self.guilds[0])
-                await self.tree.sync(guild=self.guilds[0])
+                app_cmds = await self.tree.sync(guild=self.guilds[0])
+                app_ids: dict[str, int] = {}
+                for app_cmd in app_cmds:
+                    app_ids[app_cmd.name] = app_cmd.id
+
+                for cmd in self.tree.get_commands(guild=self.guilds[0]):
+                    if isinstance(cmd, Group):
+                        for inner in cmd.commands:
+                            inner.mention = f"</{inner.qualified_name}:{app_ids[cmd.name]}>"
+                    else:
+                        cmd.mention = f"</{cmd.name}:{app_ids[cmd.name]}>"
+
                 self.synced = True
                 self.log.info('- Discord Commands registered.')
                 if 'discord_status' in self.locals:
@@ -253,7 +273,9 @@ class DCSServerBot(commands.Bot):
     async def on_app_command_error(self, interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
         if isinstance(error, discord.app_commands.CommandNotFound) or isinstance(error, discord.app_commands.CommandInvokeError):
             pass
+        # noinspection PyUnresolvedReferences
         if not interaction.response.is_done():
+            # noinspection PyUnresolvedReferences
             await interaction.response.defer(ephemeral=True)
         if isinstance(error, discord.app_commands.NoPrivateMessage):
             await interaction.followup.send(f"{interaction.command.name} can't be used in a DM.")
@@ -279,7 +301,7 @@ class DCSServerBot(commands.Bot):
             return rc
 
     async def audit(self, message, *, user: Optional[Union[discord.Member, str]] = None,
-                    server: Optional[Server] = None):
+                    server: Optional["Server"] = None):
         if not self.audit_channel:
             if 'audit_channel' in self.locals:
                 self.audit_channel = self.get_channel(int(self.locals['audit_channel']))
@@ -303,77 +325,70 @@ class DCSServerBot(commands.Bot):
                 embed.add_field(name='Server', value=server.display_name)
             embed.set_footer(text=datetime.now(timezone.utc).strftime("%y-%m-%d %H:%M:%S"))
             await self.audit_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions(replied_user=False))
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                conn.execute("""
+        async with self.apool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute("""
                     INSERT INTO audit (node, event, server_name, discord_id, ucid)
                     VALUES (%s, %s, %s, %s, %s)
                 """, (self.node.name, message, server.name if server else None,
                       user.id if isinstance(user, discord.Member) else None,
                       user if isinstance(user, str) else None))
 
-    def get_admin_channel(self, server: Server) -> discord.TextChannel:
+    def get_admin_channel(self, server: "Server") -> discord.TextChannel:
         admin_channel = self.locals.get('admin_channel')
         if not admin_channel:
             admin_channel = int(server.channels.get(Channel.ADMIN, -1))
         return self.get_channel(admin_channel)
 
-    def get_ucid_by_name(self, name: str) -> Tuple[Optional[str], Optional[str]]:
-        with self.pool.connection() as conn:
-            with closing(conn.cursor()) as cursor:
-                search = f'%{name}%'
-                cursor.execute('SELECT ucid, name FROM players WHERE LOWER(name) like LOWER(%s) '
-                               'ORDER BY last_seen DESC LIMIT 1', (search, ))
-                if cursor.rowcount >= 1:
-                    res = cursor.fetchone()
-                    return res[0], res[1]
-                else:
-                    return None, None
+    async def get_ucid_by_name(self, name: str) -> tuple[Optional[str], Optional[str]]:
+        async with self.apool.connection() as conn:
+            search = f'%{name}%'
+            cursor = await conn.execute("""
+                SELECT ucid, name FROM players 
+                WHERE LOWER(name) like LOWER(%s) 
+                ORDER BY last_seen DESC LIMIT 1
+            """, (search, ))
+            if cursor.rowcount >= 1:
+                res = await cursor.fetchone()
+                return res[0], res[1]
+            else:
+                return None, None
 
-    def get_member_or_name_by_ucid(self, ucid: str, verified: bool = False) -> Optional[Union[discord.Member, str]]:
-        with self.pool.connection() as conn:
-            with closing(conn.cursor()) as cursor:
-                sql = 'SELECT discord_id, name FROM players WHERE ucid = %s'
-                if verified:
-                    sql += ' AND discord_id <> -1 AND manual IS TRUE'
-                cursor.execute(sql, (ucid, ))
-                if cursor.rowcount == 1:
-                    row = cursor.fetchone()
-                    return self.guilds[0].get_member(row[0]) or row[1]
-                else:
-                    return None
+    async def get_member_or_name_by_ucid(self, ucid: str, verified: bool = False) -> Optional[Union[discord.Member, str]]:
+        async with self.apool.connection() as conn:
+            sql = 'SELECT discord_id, name FROM players WHERE ucid = %s'
+            if verified:
+                sql += ' AND discord_id <> -1 AND manual IS TRUE'
+            cursor = await conn.execute(sql, (ucid, ))
+            if cursor.rowcount == 1:
+                row = await cursor.fetchone()
+                return self.guilds[0].get_member(row[0]) or row[1]
+            else:
+                return None
 
-    def get_ucid_by_member(self, member: discord.Member, verified: Optional[bool] = False) -> Optional[str]:
-        with self.pool.connection() as conn:
-            with closing(conn.cursor()) as cursor:
-                sql = 'SELECT ucid FROM players WHERE discord_id = %s AND LENGTH(ucid) = 32 '
-                if verified:
-                    sql += 'AND manual IS TRUE '
-                sql += 'ORDER BY last_seen DESC'
-                cursor.execute(sql, (member.id, ))
-                if cursor.rowcount >= 1:
-                    return cursor.fetchone()[0]
-                else:
-                    return None
+    async def get_ucid_by_member(self, member: discord.Member, verified: Optional[bool] = False) -> Optional[str]:
+        async with self.apool.connection() as conn:
+            sql = 'SELECT ucid FROM players WHERE discord_id = %s AND LENGTH(ucid) = 32 '
+            if verified:
+                sql += 'AND manual IS TRUE '
+            sql += 'ORDER BY last_seen DESC'
+            cursor = await conn.execute(sql, (member.id, ))
+            if cursor.rowcount >= 1:
+                return (await cursor.fetchone())[0]
+            else:
+                return None
 
+    # TODO: change to async (after change in DataClasses)
     def get_member_by_ucid(self, ucid: str, verified: Optional[bool] = False) -> Optional[discord.Member]:
         with self.pool.connection() as conn:
-            with closing(conn.cursor()) as cursor:
-                sql = 'SELECT discord_id FROM players WHERE ucid = %s AND discord_id <> -1'
-                if verified:
-                    sql += ' AND manual IS TRUE'
-                cursor.execute(sql, (ucid, ))
-                if cursor.rowcount == 1:
-                    return self.guilds[0].get_member(cursor.fetchone()[0])
-                else:
-                    return None
-
-    def get_player_by_ucid(self, ucid: str, active: Optional[bool] = True) -> Optional[Player]:
-        for server in self.servers.values():
-            player = server.get_player(ucid=ucid, active=active)
-            if player:
-                return player
-        return None
+            sql = 'SELECT discord_id FROM players WHERE ucid = %s AND discord_id <> -1'
+            if verified:
+                sql += ' AND manual IS TRUE'
+            cursor = conn.execute(sql, (ucid, ))
+            if cursor.rowcount == 1:
+                return self.guilds[0].get_member(cursor.fetchone()[0])
+            else:
+                return None
 
     def match_user(self, data: dict, rematch=False) -> Optional[discord.Member]:
         if not rematch:
@@ -383,7 +398,7 @@ class DCSServerBot(commands.Bot):
         return utils.match(data['name'], [x for x in self.get_all_members() if not x.bot])
 
     def get_server(self, ctx: Union[discord.Interaction, discord.Message, str], *,
-                   admin_only: Optional[bool] = False) -> Optional[Server]:
+                   admin_only: Optional[bool] = False) -> Optional["Server"]:
         if len(self.servers) == 1:
             if admin_only and int(self.locals.get('admin_channel', 0)) == ctx.channel.id:
                 return list(self.servers.values())[0]
@@ -397,7 +412,7 @@ class DCSServerBot(commands.Bot):
                 for channel in [Channel.ADMIN, Channel.STATUS, Channel.EVENTS, Channel.CHAT,
                                 Channel.COALITION_BLUE_EVENTS, Channel.COALITION_BLUE_CHAT,
                                 Channel.COALITION_RED_EVENTS, Channel.COALITION_RED_CHAT]:
-                    if int(server.locals['channels'].get(channel.value, -1)) != -1 and \
+                    if int(server.locals.get('channels', {}).get(channel.value, -1)) != -1 and \
                             server.channels[channel] == ctx.channel.id:
                         return server
             else:
@@ -406,25 +421,29 @@ class DCSServerBot(commands.Bot):
         return None
 
     async def setEmbed(self, *, embed_name: str, embed: discord.Embed, channel_id: Union[Channel, int] = Channel.STATUS,
-                       file: Optional[discord.File] = None, server: Optional[Server] = None):
+                       file: Optional[discord.File] = None, server: Optional["Server"] = None):
         async with self.lock:
             if server and isinstance(channel_id, Channel):
                 channel_id = int(server.channels.get(channel_id, -1))
+                # we should not write to this channel
+                if channel_id == -1:
+                    return
             else:
                 channel_id = int(channel_id)
             channel = self.get_channel(channel_id)
-            if not channel and channel_id != -1:
+            if not channel:
                 channel = await self.fetch_channel(channel_id)
             if not channel:
                 self.log.error(f"Channel {channel_id} not found, can't add or change an embed in there!")
                 return
 
-            with self.pool.connection() as conn:
+            async with self.apool.connection() as conn:
                 # check if we have a message persisted already
-                row = conn.execute("""
+                cursor = await conn.execute("""
                     SELECT embed FROM message_persistence 
                     WHERE server_name = %s AND embed_name = %s
-                """, (server.name if server else 'Master', embed_name)).fetchone()
+                """, (server.name if server else 'Master', embed_name))
+                row = await cursor.fetchone()
 
             message = None
             if row:
@@ -441,9 +460,9 @@ class DCSServerBot(commands.Bot):
                     return
             if not row or not message:
                 message = await channel.send(embed=embed, file=file)
-                with self.pool.connection() as conn:
-                    with conn.transaction():
-                        conn.execute("""
+                async with self.apool.connection() as conn:
+                    async with conn.transaction():
+                        await conn.execute("""
                             INSERT INTO message_persistence (server_name, embed_name, embed) 
                             VALUES (%s, %s, %s) 
                             ON CONFLICT (server_name, embed_name) 

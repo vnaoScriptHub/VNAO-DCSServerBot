@@ -34,7 +34,7 @@ class Sample(Plugin):
         # Do whatever is needed to initialize your plugin.
         # You usually don't need to implement this function.
 
-    def rename(self, conn: psycopg.Connection, old_name: str, new_name: str):
+    async def rename(self, conn: psycopg.AsyncConnection, old_name: str, new_name: str):
         # If a server rename takes place, you might want to update data in your created tables
         # if they contain a server_name value. You usually don't need to implement this function.
         ...
@@ -46,6 +46,7 @@ class Sample(Plugin):
                      server: app_commands.Transform[Server, utils.ServerTransformer(status=[
                          Status.RUNNING, Status.PAUSED, Status.STOPPED])
                      ], text: str):
+        # noinspection PyUnresolvedReferences
         await interaction.response.defer(thinking=True)
         # Calls can be done async (default) or synchronous, which means we will wait for a response from DCS
         data = await server.send_to_dcs_sync({

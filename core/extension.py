@@ -1,6 +1,10 @@
 from __future__ import annotations
+
+import asyncio
+import logging
+
 from abc import ABC
-from typing import Optional, TYPE_CHECKING, Tuple
+from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from core import Server
@@ -9,15 +13,22 @@ __all__ = ["Extension"]
 
 
 class Extension(ABC):
+    started_schedulers = set()
 
     def __init__(self, server: Server, config: dict):
         self.node = server.node
-        self.log = self.node.log
+        self.log = logging.getLogger(__name__)
         self.pool = self.node.pool
+        self.loop = asyncio.get_event_loop()
         self.config: dict = config
         self.server: Server = server
         self.locals: dict = self.load_config()
         self.running = False
+        if self.__class__.__name__ not in Extension.started_schedulers:
+            schedule = getattr(self, 'schedule', None)
+            if schedule:
+                schedule.start()
+            Extension.started_schedulers.add(self.__class__.__name__)
 
     def load_config(self) -> Optional[dict]:
         return dict()
@@ -25,27 +36,21 @@ class Extension(ABC):
     async def prepare(self) -> bool:
         return True
 
-    async def beforeMissionLoad(self, filename: str) -> Tuple[str, bool]:
+    async def beforeMissionLoad(self, filename: str) -> tuple[str, bool]:
         return filename, False
 
     async def startup(self) -> bool:
         # avoid race conditions
-        if self.is_running():
+        if await asyncio.to_thread(self.is_running):
             return True
-        schedule = getattr(self, 'schedule', None)
-        if schedule and not schedule.is_running():
-            schedule.start()
         self.running = True
         self.log.info(f"  => {self.name} launched for \"{self.server.name}\".")
         return True
 
-    async def shutdown(self) -> bool:
+    def shutdown(self) -> bool:
         # avoid race conditions
         if not self.is_running():
             return True
-        schedule = getattr(self, 'schedule', None)
-        if schedule and schedule.is_running():
-            schedule.cancel()
         self.running = False
         self.log.info(f"  => {self.name} shut down for \"{self.server.name}\".")
         return True

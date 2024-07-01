@@ -70,11 +70,17 @@ documentation for now) and you need to link the place where you downloaded FunkM
 
 > ⚠️ **Attention!**<br>
 > FunkMan stores a PNG file for every trap in the "basedir" you configured for your servers
-> (Saved Games\DCS.openbeta_server\trapsheets as default). I will add a cleanup to prune in the future, but currently,
+> (Saved Games\DCS.release_server\trapsheets as default). I will add a cleanup to prune in the future, but currently,
 > there is no auto-cleanup.
 
 ## Configuration
-Greenieboard comes as many other plugins with a yaml configuration. If you don't generate your own config, DCSServerBot
+As GreenieBoard is an optional plugin, you need to activate it in main.yaml first like so:
+```yaml
+opt_plugins:
+  - greenieboard
+```
+
+The plugin comes as many other plugins with a yaml configuration. If you don't generate your own config, DCSServerBot
 will just copy over the sample by itself and use that one. This will do it for the most users, if you don't plan to
 use the persistent mode.
 
@@ -86,7 +92,10 @@ DEFAULT:
   num_landings: 5           # display the last 5 landings
   num_rows: 10              # display 10 players
   persistent_board: false   # if true, a persistent board will be uploaded into persistent_channel
-#  persistent_channel: 123456789
+  persistent_channel: 123456789 # in which channel to post the board
+  squadrons:
+    - name: 'My Fancy Squadron 1' # Optional: display boards for these squadrons
+    - name: 'My Fancy Squadron 2'
   ratings:                  # Default points per LSO rating, amend them to your needs
     _OK_: 5
     OK: 4
@@ -96,19 +105,25 @@ DEFAULT:
     OWO: 2
     WO: 1
     C: 0
-#  FunkMan:                 # if you want to use the FunkMan integration, uncomment this
-#    IMAGEPATH: ../FunkMan/funkpics/
-#    install: ../FunkMan
-DCS.openbeta_server:        # our server uses Moose.AIRBOSS
+  credits: true             # People should get credits for their landings (see CreditSystem)
   Moose.AIRBOSS:
-    basedir: airboss        # Trapsheets will be stored in Saved Games\DCS.openbeta_server\airboss
-    delete_after: 180       # they will be deleted after 180 days
+    basedir: airboss        # Trapsheets will be stored in Saved Games\<instance>\airboss
+  FunkMan:                  # if you want to use the FunkMan integration
+    IMAGEPATH: ../FunkMan/funkpics/
+    install: ../FunkMan
+DCS.release_server:         # our server uses Moose.AIRBOSS
+  num_rows: 5               # Overwrite the number of rows to display (default: 10)
+  Moose.AIRBOSS:
+    basedir: airboss        # overwrite the default in here, if you like
     grades: AIRBOSS-{carrier}_LSOGrades.csv
     trapsheets: '*AIRBOSS-{carrier}_Trapsheet-{name}_{unit_type}*.csv'
-#instance2:                 # uncomment, if you have more than one istance and name it accordingly
-#  FunkMan:                 # instance2 uses FunkMan
-#    basedir: trapsheets    # DCSServerBot will generate trapsheet images in here
-#    delete_after: 180      # they will be deleted after 180 days
+  persistent_board: true    # if true, a persistent board will be uploaded into persistent_channel
+  persistent_channel: 123456789 # Optional: in which channel to post the board (default: status channel)
+  squadrons: 
+    - name: 'My Fancy Squadron 1' # Optional: display boards for these squadrons
+      channel: 1234567890         # Optional: channel ID (default, persistent_channel above)
+    - name: 'My Fancy Squadron 2'
+      channel: 9876543210
 ```
 You can use the DCS standard way (Super Carrier), Moose.AIRBOSS and FunkMan side by side. You just need to decide on one
 of these methods per server. You only get graphical trapsheets with Moose.AIRBOSS and FunkMan, the greenieboard works 

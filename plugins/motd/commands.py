@@ -1,10 +1,14 @@
+import asyncio
 import discord
+import random
+
 from core import Plugin, PluginRequiredError, utils, Server, Player, TEventListener, Status, Coalition, \
     PluginInstallationError, command
 from discord import app_commands
 from discord.ext import tasks
+from functools import partial
 from services import DCSServerBot
-from typing import Optional, Type, Literal
+from typing import Optional, Type, Literal, AsyncGenerator
 from .listener import MOTDListener
 
 
@@ -14,33 +18,36 @@ class MOTD(Plugin):
         super().__init__(bot, eventlistener)
         if not self.locals:
             raise PluginInstallationError(reason=f"No {self.plugin_name}.yaml file found!", plugin=self.plugin_name)
-        self.last_nudge = dict[str, int]()
+        self.nudge_active: dict[str, dict[int, asyncio.TimerHandle]] = {}
+        self.lock = asyncio.Lock()
         self.nudge.start()
 
     async def cog_unload(self):
         self.nudge.cancel()
+        for server in self.bot.servers.copy().values():
+            await self._cancel_handles(server)
         await super().cog_unload()
 
-    def send_message(self, message: str, server: Server, config: dict, player: Optional[Player] = None):
+    @staticmethod
+    async def send_message(message: str, server: Server, config: dict, player: Optional[Player] = None):
         if config['display_type'].lower() == 'chat':
             if player:
-                player.sendChatMessage(message)
+                await player.sendChatMessage(message)
             else:
-                server.sendChatMessage(Coalition.ALL, message)
+                await server.sendChatMessage(Coalition.ALL, message)
         elif config['display_type'].lower() == 'popup':
             timeout = config.get('display_time', server.locals.get('message_timeout', 10))
             if player:
-                player.sendPopupMessage(message, timeout)
+                await player.sendPopupMessage(message, timeout)
                 if 'sound' in config:
-                    player.playSound(config['sound'])
+                    await player.playSound(config['sound'])
             else:
-                server.sendPopupMessage(Coalition.ALL, message, timeout)
+                await server.sendPopupMessage(Coalition.ALL, message, timeout)
                 if 'sound' in config:
-                    server.playSound(Coalition.ALL, config['sound'])
+                    await server.playSound(Coalition.ALL, config['sound'])
 
     @staticmethod
-    def get_recipients(server: Server, config: dict) -> list[Player]:
-        recp = list[Player]()
+    async def get_recipients(server: Server, config: dict) -> AsyncGenerator[Player, None]:
         players: list[Player] = server.get_active_players()
         in_roles = []
         out_roles = []
@@ -56,8 +63,7 @@ class MOTD(Plugin):
             if len(out_roles):
                 if player.member and utils.check_roles(out_roles, player.member):
                     continue
-            recp.append(player)
-        return recp
+            yield player
 
     @command(description='Test MOTD')
     @app_commands.guild_only()
@@ -65,52 +71,99 @@ class MOTD(Plugin):
     async def motd(self, interaction: discord.Interaction,
                    server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.RUNNING])],
                    player: app_commands.Transform[Player, utils.PlayerTransformer(active=True)],
-                   option: Literal['join', 'birth', 'nudge']):
+                   option: Literal['on_join', 'on_birth']):
         config = self.get_config(server)
         if not config:
+            # noinspection PyUnresolvedReferences
             await interaction.response.send_message('No configuration for MOTD found.', ephemeral=True)
             return
         if server.status not in [Status.RUNNING, Status.PAUSED]:
+            # noinspection PyUnresolvedReferences
             await interaction.response.send_message(f"Mission is {server.status.name.lower()}, can't test MOTD.",
                                                     ephemeral=True)
             return
         message = None
-        if 'join' in option:
-            message = self.eventlistener.on_join(config)
-        elif 'birth' in option:
-            message = await self.eventlistener.on_birth(config, server, player)
-        elif 'nudge' in option:
+        if option == 'on_join':
+            if not config.get(option):
+                # noinspection PyUnresolvedReferences
+                await interaction.response.send_message("on_join not set in your motd.yaml.", ephemeral=True)
+            else:
+                message = await self.eventlistener.on_join(config[option], server, player)
+        elif option == 'on_birth':
+            if not config.get(option):
+                # noinspection PyUnresolvedReferences
+                await interaction.response.send_message("on_join not set in your motd.yaml.", ephemeral=True)
+            message = await self.eventlistener.on_birth(config[option], server, player)
+        elif option == 'nudge':
             # TODO
-            pass
+            # noinspection PyUnresolvedReferences
+            await interaction.response.send_message(_("Not implemented."), ephemeral=True)
         if message:
+            # noinspection PyUnresolvedReferences
             await interaction.response.send_message(f"```{message}```")
+
+    async def _cancel_handles(self, server: Server):
+        async with self.lock:
+            # cancel open timers
+            for handle in self.nudge_active.get(server.name, {}).values():
+                handle.cancel()
+            self.nudge_active[server.name] = {}
 
     @tasks.loop(minutes=1.0)
     async def nudge(self):
-        def process_message(message: str, server: Server, config: dict):
+        async def process_message(config: dict, message: str):
             if 'recipients' in config:
-                for recp in self.get_recipients(server, config):
-                    self.send_message(message, server, config, recp)
+                async for recp in self.get_recipients(server, config):
+                    await self.send_message(message, server, config, recp)
             else:
-                self.send_message(message, server, config)
+                await self.send_message(message, server, config)
 
-        try:
-            for server_name, server in self.bot.servers.items():
-                config = self.get_config(server)
-                if server.status != Status.RUNNING or not config or 'nudge' not in config:
-                    continue
-                config = config['nudge']
-                if server.name not in self.last_nudge:
-                    self.last_nudge[server.name] = server.current_mission.mission_time
-                elif server.current_mission.mission_time - self.last_nudge[server.name] > config['delay']:
-                    if 'message' in config:
-                        message = utils.format_string(config['message'], server=server)
-                        process_message(message, server, config)
-                    elif 'messages' in config:
+        async def process_nudge(server: Server, config: dict):
+            async with self.lock:
+                delay = config['delay']
+                if server.status != Status.RUNNING:
+                    self.nudge_active[server.name].pop(delay, None)
+                    return
+                if 'message' in config:
+                    message = utils.format_string(config['message'], server=server)
+                    await process_message(config, message)
+                elif 'messages' in config:
+                    if config.get('random', False):
+                        cfg = random.choice(config['messages'])
+                        message = utils.format_string(cfg['message'], server=server)
+                        await process_message(cfg, message)
+                    else:
                         for cfg in config['messages']:
                             message = utils.format_string(cfg['message'], server=server)
-                            process_message(message, server, cfg)
-                    self.last_nudge[server.name] = server.current_mission.mission_time
+                            await process_message(cfg, message)
+                # schedule next run
+                t = self.loop.call_later(
+                    delay=delay, callback=partial(asyncio.create_task, process_nudge(server, config)))
+                self.nudge_active[server.name][delay] = t
+
+        try:
+            for server_name, server in self.bot.servers.copy().items():
+                config = self.get_config(server)
+                if not config or 'nudge' not in config:
+                    continue
+                handles = self.nudge_active.get(server_name, {})
+                if server.status != Status.RUNNING:
+                    if handles:
+                        await self._cancel_handles(server)
+                    return
+                elif handles:
+                    return
+                config = config['nudge']
+                self.nudge_active[server_name] = {}
+                if isinstance(config, list):
+                    for c in config:
+                        t = self.loop.call_later(
+                            delay=c['delay'], callback=partial(asyncio.create_task, process_nudge(server, c)))
+                        self.nudge_active[server_name][c['delay']] = t
+                else:
+                    t = self.loop.call_later(
+                        delay=config['delay'], callback=partial(asyncio.create_task, process_nudge(server, config)))
+                    self.nudge_active[server_name][config['delay']] = t
         except Exception as ex:
             self.log.exception(ex)
 

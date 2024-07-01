@@ -1,6 +1,4 @@
 local base      = _G
-local Terrain   = base.require('terrain')
-local UC        = base.require("utils_common")
 
 local dcsbot    = base.dcsbot
 local utils 	= base.require("DCSServerBotUtils")
@@ -46,11 +44,14 @@ function mission.onPlayerTryConnect(addr, name, ucid, playerID)
         return false, config.MESSAGE_PLAYER_DEFAULT_USERNAME
     end
     local name2 = name:gsub("[\r\n%z]", "")
+    -- local name2 = name:gsub("[%c]", "")
     if name ~= name2 then
         return false, config.MESSAGE_PLAYER_USERNAME
     end
     ipaddr = utils.getIP(addr)
     if isBanned(ucid) then
+        -- add their IP to the smart ban system
+        dcsbot.banList[ipaddr] = ucid
         local msg = {
             command = 'sendMessage',
             message = 'Banned user ' .. name .. ' (ucid=' .. ucid .. ') rejected.'
@@ -61,7 +62,8 @@ function mission.onPlayerTryConnect(addr, name, ucid, playerID)
         local old_ucid = dcsbot.banList[ipaddr]
         local msg = {
             command = 'sendMessage',
-            message = 'Banned user ' .. name .. ' (ucid=' .. old_ucid .. ', IP=' .. ipaddr ..') attempted to connect with ucid ' .. ucid
+            message = 'Player ' .. name .. ' (ucid=' .. ucid .. ') connected from the same IP as banned player (ucid=' .. old_ucid .. ')!',
+            mention = 'DCS Admin'
         }
         utils.sendBotTable(msg, config.ADMIN_CHANNEL)
         return false, string.gsub(config.MESSAGE_BAN, "{}", dcsbot.banList[old_ucid])
@@ -114,76 +116,10 @@ function mission.onMissionLoadEnd()
 
     msg.num_slots_blue = num_slots_blue
     msg.num_slots_red = num_slots_red
-    msg.weather = DCS.getCurrentMission().mission.weather
-    local clouds = msg.weather.clouds
-    if clouds.preset ~= nil then
-        local func, err = loadfile(lfs.currentdir() .. '/Config/Effects/clouds.lua')
-
-        local env = {
-            type = _G.type,
-            next = _G.next,
-            setmetatable = _G.setmetatable,
-            getmetatable = _G.getmetatable,
-            _ = _,
-        }
-        setfenv(func, env)
-        func()
-        local preset = env.clouds and env.clouds.presets and env.clouds.presets[clouds.preset]
-        if preset ~= nil then
-            msg.clouds = {}
-            msg.clouds.base = clouds.base
-            msg.clouds.preset = preset
-        end
-    else
-        msg.clouds = clouds
-    end
+    -- weather
+    msg.weather = {}
+    -- airbases
     msg.airbases = {}
-    for airdromeID, airdrome in pairs(Terrain.GetTerrainConfig("Airdromes")) do
-        if (airdrome.reference_point) and (airdrome.abandoned ~= true)  then
-            local airbase = {}
-            airbase.code = airdrome.code
-            if airdrome.display_name then
-                airbase.name = airdrome.display_name
-            else
-                airbase.name = airdrome.names['en']
-            end
-            airbase.id = airdrome.id
-            airbase.lat, airbase.lng = Terrain.convertMetersToLatLon(airdrome.reference_point.x, airdrome.reference_point.y)
-            airbase.alt = Terrain.GetHeight(airdrome.reference_point.x, airdrome.reference_point.y)
-            airbase.position = {}
-            airbase.position.x = airdrome.reference_point.x
-            airbase.position.y = airbase.alt
-            airbase.position.z = airdrome.reference_point.y
-            local frequencyList = {}
-            if airdrome.frequency then
-                frequencyList	= airdrome.frequency
-            else
-                if airdrome.radio then
-                    for k, radioId in pairs(airdrome.radio) do
-                        local frequencies = DCS.getATCradiosData(radioId)
-                        if frequencies then
-                            for kk,vv in pairs(frequencies) do
-                                table.insert(frequencyList, vv)
-                            end
-                        end
-                    end
-                end
-            end
-            airbase.frequencyList = frequencyList
-            airbase.runwayList = {}
-            if (airdrome.runwayName ~= nil) then
-                for r, runwayName in pairs(airdrome.runwayName) do
-                    table.insert(airbase.runwayList, runwayName)
-                end
-            end
-            heading = UC.toDegrees(Terrain.getRunwayHeading(airdrome.roadnet))
-            if (heading < 0) then
-                heading = 360 + heading
-            end
-            airbase.rwy_heading = heading
-            table.insert(msg.airbases, airbase)
-        end
-    end
     msg.dsmc_enabled = (base.HOOK ~= nil)
     utils.sendBotTable(msg)
 end
@@ -198,6 +134,7 @@ function mission.onPlayerConnect(id)
         id = id,
         name = net.get_player_info(id, 'name'),
         ucid = net.get_player_info(id, 'ucid'),
+        ipaddr = utils.getIP(net.get_player_info(id, 'ipaddr')),
         side = 0
     }
     -- server user is never active
@@ -222,6 +159,7 @@ function mission.onPlayerStart(id)
         id = id,
         ucid = net.get_player_info(id, 'ucid'),
         name = net.get_player_info(id, 'name'),
+        ipaddr = utils.getIP(net.get_player_info(id, 'ipaddr')),
         side = 0,
         slot = -1,
         sub_slot = -1
@@ -309,11 +247,11 @@ function mission.onSimulationResume()
 end
 
 local function handleTakeoffLanding(arg1)
-    if utils.isWithinInterval(mission.last_change_slot[arg1], 60) then
-        return False
+    if utils.isWithinInterval(mission.last_change_slot[arg1], 20) then
+        return false
     end
-    if utils.isWithinInterval(mission.last_to_landing[arg1], 10) then
-        return False
+    if utils.isWithinInterval(mission.last_to_landing[arg1], 30) then
+        return false
     else
         mission.last_to_landing[arg1] = os.clock()
     end
@@ -322,6 +260,7 @@ end
 local eventHandlers = {
     change_slot = function(arg1)
         mission.last_change_slot[arg1] = os.clock()
+        log.write('DCSServerBot', log.DEBUG, 'Mission: change_slot(' .. arg1 .. ') = ' .. mission.last_change_slot[arg1])
     end,
     takeoff = handleTakeoffLanding,
     landing = handleTakeoffLanding,
@@ -332,15 +271,27 @@ local eventHandlers = {
         if display_name == arg2 then
             -- ignore "spawn on top"
             if utils.isWithinInterval(mission.last_change_slot[arg1], 60) or utils.isWithinInterval(mission.last_change_slot[arg3], 60) then
-                return False
+                return false
             end
             -- ignore multiple collisions that happened in-between 10s
             if (utils.isWithinInterval(mission.last_collision[arg1], 10) and mission.last_victim[arg1] == arg3) or (utils.isWithinInterval(mission.last_collision[arg3], 10) and mission.last_victim[arg3] == arg1) then
-                return False
+                return false
             else
                 mission.last_collision[arg1] = os.clock()
                 mission.last_collision[arg3] = os.clock()
                 mission.last_victim[arg1] = arg3
+                mission.last_victim[arg3] = arg1
+            end
+        end
+    end,
+    kill = function(arg1,arg2,arg3,arg4,arg5,arg6,arg7)
+        unit_type, slot, sub_slot = utils.getMulticrewAllParameters(arg1)
+        display_name = DCS.getUnitTypeAttribute(DCS.getUnitType(slot), "DisplayName")
+        -- do we have collision kill (weapon == unit name)
+        if display_name == arg7 then
+            -- ignore collision kills that happened in-between 10s
+            if (utils.isWithinInterval(mission.last_collision[arg1], 10) and mission.last_victim[arg1] == arg4) or (utils.isWithinInterval(mission.last_collision[arg4], 10) and mission.last_victim[arg4] == arg1) then
+                return false
             end
         end
     end

@@ -21,8 +21,9 @@ local function createSimulationFrameHandler()
     local ip = socket.dns.toip(host)
     local UDPRecvSocket = socket.udp()
     UDPRecvSocket:setsockname(ip, port)
-    UDPRecvSocket:settimeout(0.0001)
+    UDPRecvSocket:settimeout(0)
     UDPRecvSocket:setoption('reuseaddr', true)
+    log.write('DCSServerBot', log.DEBUG, 'Listening on port ' .. tostring(port) .. '/udp')
 
     return function()
         local msg, err

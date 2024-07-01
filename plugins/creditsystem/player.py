@@ -1,12 +1,11 @@
 from contextlib import closing
-
 from core import Player, DataObjectFactory, utils, Plugin
 from dataclasses import field, dataclass
 from typing import cast
 
 
 @dataclass
-@DataObjectFactory.register("Player")
+@DataObjectFactory.register(Player)
 class CreditPlayer(Player):
     _points: int = field(compare=False, default=-1)
     deposit: int = field(compare=False, default=0)
@@ -24,11 +23,6 @@ class CreditPlayer(Player):
                                    (campaign_id, self.ucid))
                     if cursor.rowcount == 1:
                         self._points = cursor.fetchone()[0]
-                        self.server.send_to_dcs({
-                            'command': 'updateUserPoints',
-                            'ucid': self.ucid,
-                            'points': self._points
-                        })
                     else:
                         self.log.debug(
                             f'CreditPlayer: No entry found in credits table for player {self.name}({self.ucid})')
@@ -59,11 +53,11 @@ class CreditPlayer(Player):
         else:
             self.log.debug("No campaign active, player points will vanish after a bot restart.")
         # sending points to DCS
-        self.server.send_to_dcs({
+        self.bot.loop.create_task(self.server.send_to_dcs({
             'command': 'updateUserPoints',
             'ucid': self.ucid,
             'points': self._points
-        })
+        }))
 
     def audit(self, event: str, old_points: int, remark: str):
         if old_points == self.points:

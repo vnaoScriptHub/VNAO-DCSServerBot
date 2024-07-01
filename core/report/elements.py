@@ -5,11 +5,12 @@ import discord
 import inspect
 import numpy as np
 import os
+import re
 import sys
 import uuid
+import warnings
 
 from abc import ABC, abstractmethod
-from contextlib import closing
 from core import utils
 from datetime import timedelta, datetime
 from discord import ButtonStyle, Interaction
@@ -45,6 +46,23 @@ __all__ = [
     "SQLPieChart"
 ]
 
+_languages = None
+
+
+def get_supported_fonts() -> set[str]:
+    global _languages
+
+    if _languages is None:
+        _languages = set()
+        if os.path.exists('fonts'):
+            for filename in os.listdir('fonts'):
+                if filename.startswith("NotoSans"):
+                    match = re.search(r"NotoSans(..)-", filename)
+                    if match:
+                        lang = match.group(1)
+                        _languages.add(lang)
+    return _languages
+
 
 class ReportElement(ABC):
     def __init__(self, env: ReportEnv):
@@ -53,6 +71,7 @@ class ReportElement(ABC):
         self.node = self.bot.node
         self.log = env.bot.log
         self.pool = env.bot.pool
+        self.apool = env.bot.apool
 
     @abstractmethod
     async def render(self, **kwargs):
@@ -65,9 +84,13 @@ class EmbedElement(ReportElement):
         self.embed = env.embed
 
     def add_field(self, *, name, value, inline=True):
-        return self.embed.add_field(name=name[:256] or '_ _',
-                                    value=(value[:1024] if isinstance(value, str) else value) or '_ _',
-                                    inline=inline)
+        if len(self.embed.fields) >= 25:
+            return
+        if len(name) > 256:
+            name = name[:252] + ' ...'
+        if isinstance(value, str) and len(value) > 1024:
+            value = value[:1020] + ' ...'
+        return self.embed.add_field(name=name or '_ _', value=value or '_ _', inline=inline)
 
     def set_image(self, *, url):
         return self.embed.set_image(url=url)
@@ -84,18 +107,14 @@ class Image(EmbedElement):
 
 class Ruler(EmbedElement):
     async def render(self, header: Optional[str] = '', ruler_length: Optional[int] = 34, *, text: Optional[str] = None):
-        if header:
-            header = ' ' + header + ' '
-        filler = int((ruler_length - len(header) / 2.5) / 2)
-        if filler <= 0:
-            filler = 1
-        self.add_field(name='▬' * filler + header + '▬' * filler, value=text or '_ _', inline=False)
+        self.add_field(name=utils.print_ruler(header=header, ruler_length=ruler_length),
+                       value=text or '_ _', inline=False)
 
 
 class Field(EmbedElement):
-    async def render(self, name: str, value: Any, inline: Optional[bool] = True):
+    async def render(self, name: str, value: Any, inline: Optional[bool] = True, default: Optional[str] = '_ _'):
         self.add_field(name=utils.format_string(name, '_ _', **self.env.params),
-                       value=utils.format_string(value, '_ _', **self.env.params), inline=inline)
+                       value=utils.format_string(value, default, **self.env.params), inline=inline)
 
 
 class Table(EmbedElement):
@@ -140,10 +159,11 @@ class Button(ReportElement):
 
 
 class GraphElement(ReportElement):
-    def __init__(self, env: ReportEnv, rows: int, cols: int, row: int, col: int,
-                 colspan: Optional[int] = 1, rowspan: Optional[int] = 1):
+    def __init__(self, env: ReportEnv, rows: int, cols: int, row: Optional[int] = 0, col: Optional[int] = 0,
+                 colspan: Optional[int] = 1, rowspan: Optional[int] = 1, polar: Optional[bool] = False):
         super().__init__(env)
-        self.axes = plt.subplot2grid((rows, cols), (row, col), colspan=colspan, rowspan=rowspan, fig=self.env.figure)
+        self.axes = plt.subplot2grid((rows, cols), (row, col), colspan=colspan, rowspan=rowspan, fig=self.env.figure,
+                                     polar=polar)
 
     @abstractmethod
     async def render(self, **kwargs):
@@ -160,7 +180,8 @@ class MultiGraphElement(ReportElement):
             sharex = params[i]['sharex'] if 'sharex' in params[i] else False
             self.axes.append(plt.subplot2grid((rows, cols), (params[i]['row'], params[i]['col']), colspan=colspan,
                                               rowspan=rowspan, fig=self.env.figure,
-                                              sharex=self.axes[-1] if sharex else None))
+                                              sharex=self.axes[-1] if sharex else None,
+                                              polar=params[i].get('polar', False)))
 
     @abstractmethod
     async def render(self, **kwargs):
@@ -171,20 +192,30 @@ class Graph(ReportElement):
     def __init__(self, env: ReportEnv):
         super().__init__(env)
         plt.switch_backend('agg')
+        self.plot_lock = asyncio.Lock()
 
     def _plot(self):
         plt.subplots_adjust(hspace=0.5, wspace=0.5)
         self.env.filename = f'{uuid.uuid4()}.png'
         self.env.buffer = BytesIO()
+        warnings.filterwarnings("ignore", category=UserWarning, message=".*Glyph.*")
         self.env.figure.savefig(self.env.buffer, format='png', bbox_inches='tight', facecolor='#2C2F33')
         self.env.buffer.seek(0)
+
+    async def _async_plot(self):
+        async with self.plot_lock:
+            self._plot()
 
     async def render(self, width: int, height: int, cols: int, rows: int, elements: list[dict],
                      facecolor: Optional[str] = None):
         plt.style.use('dark_background')
         plt.rcParams['axes.facecolor'] = '2C2F33'
-        if 'cjk_font' in self.bot.locals.get('reports', {}):
-            plt.rcParams['font.family'] = [f"Noto Sans {self.bot.locals['reports']['cjk_font']}", 'sans-serif']
+        fonts = get_supported_fonts()
+        if fonts:
+            plt.rcParams['font.family'] = [f"Noto Sans {x}" for x in fonts] + ['sans-serif']
+            self.log.debug(f"Fonts: {plt.rcParams['font.family']}")
+        else:
+            self.log.debug("Fonts: no fonts loaded")
         self.env.figure = plt.figure(figsize=(width, height))
         try:
             if facecolor:
@@ -220,7 +251,7 @@ class Graph(ReportElement):
                 return
             # only render the graph, if we don't have a rendered graph already attached as a file (image)
             if not self.env.filename:
-                await asyncio.create_task(asyncio.to_thread(self._plot))
+                await self._async_plot()
             self.env.embed.set_image(url='attachment://' + os.path.basename(self.env.filename))
             footer = self.env.embed.footer.text or ''
             if footer is None:
@@ -233,9 +264,10 @@ class Graph(ReportElement):
                 plt.close(self.env.figure)
                 self.env.figure = None
 
+
 def _display_no_data(element: EmbedElement, no_data: Union[str, dict], inline: bool):
     if isinstance(no_data, str):
-        element.add_field(name='_ _', value=no_data)
+        element.add_field(name='_ _', value=no_data, inline=inline)
     else:
         for name, value in no_data.items():
             element.add_field(name=name, value=value, inline=inline)
@@ -243,11 +275,11 @@ def _display_no_data(element: EmbedElement, no_data: Union[str, dict], inline: b
 
 class SQLField(EmbedElement):
     async def render(self, sql: str, inline: Optional[bool] = True, no_data: Optional[Union[str, dict]] = None):
-        with self.pool.connection() as conn:
-            with closing(conn.cursor(row_factory=dict_row)) as cursor:
-                cursor.execute(utils.format_string(sql, **self.env.params), self.env.params)
+        async with self.apool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(utils.format_string(sql, **self.env.params), self.env.params)
                 if cursor.rowcount > 0:
-                    row = cursor.fetchone()
+                    row = await cursor.fetchone()
                     name = list(row.keys())[0]
                     value = row[name]
                     if isinstance(value, datetime):
@@ -261,17 +293,17 @@ class SQLField(EmbedElement):
 class SQLTable(EmbedElement):
     async def render(self, sql: str, inline: Optional[bool] = True, no_data: Optional[Union[str, dict]] = None,
                      ansi_colors: Optional[bool] = False):
-        with self.pool.connection() as conn:
-            with closing(conn.cursor(row_factory=dict_row)) as cursor:
-                cursor.execute(utils.format_string(sql, **self.env.params), self.env.params)
+        async with self.apool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(utils.format_string(sql, **self.env.params), self.env.params)
                 if cursor.rowcount == 0:
                     if no_data:
-                        _display_no_data(self, no_data, inline)
+                        _display_no_data(self, no_data, False)
                     return
                 header = None
                 cols = []
                 elements = 0
-                for row in cursor:
+                async for row in cursor:
                     elements = len(row)
                     if not header:
                         header = list(row.keys())
@@ -337,14 +369,14 @@ class BarChart(GraphElement):
 
 class SQLBarChart(BarChart):
     async def render(self, sql: str):
-        with self.pool.connection() as conn:
-            with closing(conn.cursor(row_factory=dict_row)) as cursor:
-                cursor.execute(utils.format_string(sql, **self.env.params), self.env.params)
+        async with self.apool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(utils.format_string(sql, **self.env.params), self.env.params)
                 if cursor.rowcount == 1:
-                    await super().render(cursor.fetchone())
+                    await super().render(await cursor.fetchone())
                 elif cursor.rowcount > 1:
                     values = {}
-                    for row in cursor:
+                    async for row in cursor:
                         d = list(row.values())
                         values[d[0]] = d[1]
                     await super().render(values)
@@ -392,14 +424,14 @@ class PieChart(GraphElement):
 
 class SQLPieChart(PieChart):
     async def render(self, sql: str):
-        with self.pool.connection() as conn:
-            with closing(conn.cursor(row_factory=dict_row)) as cursor:
-                cursor.execute(utils.format_string(sql, **self.env.params), self.env.params)
+        async with self.apool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(utils.format_string(sql, **self.env.params), self.env.params)
                 if cursor.rowcount == 1:
-                    await super().render(cursor.fetchone())
+                    await super().render(await cursor.fetchone())
                 elif cursor.rowcount > 1:
                     values = {}
-                    for row in cursor:
+                    async for row in cursor:
                         d = list(row.values())
                         values[d[0]] = d[1]
                     await super().render(values)

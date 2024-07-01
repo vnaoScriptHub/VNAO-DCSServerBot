@@ -24,7 +24,7 @@ To use the persistent highscore, you need to add a file named userstats.json to 
       }
     },
     {
-      "installation": "DCS.openbeta_server",
+      "installation": "DCS.release_server",
       "highscore": {
         "channel": 826772687216181456,
         "params": {
@@ -41,7 +41,7 @@ More highscores per server are supported, if you provide a list instead:
 {
   "configs": [
     {
-      "installation": "DCS.openbeta_server",
+      "installation": "DCS.release_server",
       "highscore": [
         {
           "channel": 826772687216181456,
@@ -72,7 +72,6 @@ If the AUTOMATCH is disabled or was not successful, users can generate a unique 
 ```.linkme```. The TOKEN can then be entered in the in-game chat as a chat-command with ```-linkme TOKEN```.
 
 ## Discord Commands
-
 | Command                | Parameter                                        | Channel | Role      | Description                                                                                         |
 |------------------------|--------------------------------------------------|---------|-----------|-----------------------------------------------------------------------------------------------------|
 | .statistics/.stats     | [@member / DCS name / ucid] [day/week/month/all] | all     | DCS       | Display your own statistics or that of a specific member.                                           |

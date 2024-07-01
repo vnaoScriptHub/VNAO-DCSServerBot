@@ -4,7 +4,13 @@ configuration described in here.<br>
 The ideas of this plugin are based on [Slmod](https://github.com/mrSkortch/DCS-SLmod). Thanks to Speed for his awesome solution!
 
 ## Configuration
-The punishment is configured with a file named config/plugins/punishment.yaml. You'll find a sample in ./samples:
+As Punishment is an optional plugin, you need to activate it in main.yaml first like so:
+```yaml
+opt_plugins:
+  - punishment
+```
+
+The plugin itself is configured with a file named config/plugins/punishment.yaml. You'll find a sample in ./samples:
 ```yaml
 DEFAULT:
   penalties:                # These are the penalty points to use.
@@ -55,14 +61,14 @@ DEFAULT:
     weight: 0.25
   - days: 60                # after 60 days, the penalty points get wiped completely                
     weight: 0
-DCS.openbeta_server:
+DCS.release_server:
   exemptions:
-  - ucid:
-    - 'aabbccddee'          # Do not punish the users with these UCIDs
-    - 'eeggffjjjs'
-  - discord: 
-    - '@everyone'           # Do not punish members of your Discord (that are linked) on this server
-    - 'Moderators'          # Do not punish your own moderators (Discord role, not bot role!) on this server
+    ucid:
+      - 'aabbccddee'          # Do not punish the users with these UCIDs
+      - 'eeggffjjjs'
+    discord: 
+      - '@everyone'           # Do not punish members of your Discord (that are linked) on this server
+      - 'Moderators'          # Do not punish your own moderators (Discord role, not bot role!) on this server
 ```
 ### Penalties
 The number of penalty points that a player "earns", is configured here. Collisions are hits where the players aircraft is being used as a weapon.
@@ -91,7 +97,7 @@ To prevent actions to be executed against an initiator, victims can use the `.fo
 This will delete the punishments to this user that are not executed already and delete the events from this specific 
 occasion.
 
-### Weight per Flighthours
+### Weight per Flight-Hours
 Weight punishment by flight hours. This will be the sum of flight hours over all servers handled by this bot.
 
 ### Decay
@@ -99,7 +105,6 @@ Penalty points will decrease over time. This is configured here.
 Decay can only be configured once, so there is no need for a server specific configuration. All other elements can be configured for every server instance differently.
 
 ## Discord Commands
-
 | Command      | Parameter | Channel | Role            | Description                                                                                                              |
 |--------------|-----------|---------|-----------------|--------------------------------------------------------------------------------------------------------------------------|
 | /forgive     | user      | all     | DCS Admin       | Deletes all punishment points for this member / user.                                                                    |
@@ -107,10 +112,10 @@ Decay can only be configured once, so there is no need for a server specific con
 | /infractions | user      | all     | DCS Admin       | Display the last (default: 10) infraction events of that user.<br>Mission statistics needs to be enabled for it to work. |
 
 ## In-Game Chat Commands
-
-| Command  | Parameter | Role      | Description                                            |
-|----------|-----------|-----------|--------------------------------------------------------|
-| .forgive |           | all       | Forgive the last actions that happend to your player.  |
+| Command  | Parameter | Role | Description                                            |
+|----------|-----------|------|--------------------------------------------------------|
+| -forgive |           | all  | Forgive the last actions that happened to your player. |
+| -penalty |           | all  | Shows your penalty points.                             |
 
 ## How to use the penalty system inside of missions
 To use the penalty system inside of missions, you can use this lua-function:
@@ -131,6 +136,16 @@ Following the example above, a possible call could be:
     end
 [...]
 ```
+
+### How to disable punishments inside of missions
+Sometimes you don't want your mission to punish users at all, but you don't want to configure your server to 
+disable them forever. To do so, you can just disable the punishments from inside your mission:
+```lua
+if dcsbot then
+    dcsbot.disablePunishments()    
+end 
+```
+
 
 ## Tables
 ### pu_events

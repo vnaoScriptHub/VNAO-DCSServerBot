@@ -7,7 +7,6 @@ import os
 
 from contextlib import suppress
 from core import Node
-from typing import Tuple
 
 
 class CloudLoggingHandler(logging.Handler):
@@ -17,13 +16,14 @@ class CloudLoggingHandler(logging.Handler):
         self.url = url
         self.cwd = os.getcwd()
 
-    def format_traceback(self, trace: traceback) -> Tuple[str, int, list[str]]:
+    def format_traceback(self, trace: traceback) -> tuple[str, int, list[str]]:
         ret = []
         file = None
         line = -1
         while trace is not None:
             filename = trace.tb_frame.f_code.co_filename
-            if self.cwd in filename and '\\venv\\' not in filename:
+            directories_to_exclude = ['\\venv\\', '\\.venv\\']
+            if self.cwd in filename and all(directory not in filename for directory in directories_to_exclude):
                 filename = os.path.relpath(filename, self.cwd)
                 if not file:
                     file = filename
@@ -33,13 +33,19 @@ class CloudLoggingHandler(logging.Handler):
         return file or '<unknown>', line, ret
 
     async def send_post(self, record: logging.LogRecord):
-        if isinstance(record.exc_info[1], discord.app_commands.CommandInvokeError):
-            exc = record.exc_info[1].original
+        exc_info = record.exc_info
+        if (isinstance(exc_info, tuple) and len(exc_info) > 1 and
+                isinstance(exc_info[1], discord.app_commands.CommandInvokeError)):
+            exc = exc_info[1].original
+        elif isinstance(exc_info, tuple) and len(exc_info) > 1:
+            exc = exc_info[1]
         else:
-            exc = record.exc_info[1]
-        file, line, trace = self.format_traceback(exc.__traceback__) if exc else (record.filename, record.lineno, [record.funcName])
+            exc = None
+        file, line, trace = self.format_traceback(exc.__traceback__) \
+            if exc else (record.filename, record.lineno, [record.funcName])
         with suppress(Exception):
             async with aiohttp.ClientSession() as session:
+                # noinspection PyUnresolvedReferences
                 await session.post(self.url, json={
                     "guild_id": self.node.guild_id,
                     "version": f"{self.node.bot_version}.{self.node.sub_version}",
@@ -50,6 +56,6 @@ class CloudLoggingHandler(logging.Handler):
                 })
 
     def emit(self, record: logging.LogRecord):
-        if record.levelname in ['ERROR', 'CRITICAL'] and record.exc_info is not None:
-            loop = asyncio.get_event_loop()
-            loop.create_task(self.send_post(record))
+        if record.levelno in [logging.ERROR, logging.CRITICAL] and record.exc_info is not None:
+            with suppress(Exception):
+                asyncio.create_task(self.send_post(record))

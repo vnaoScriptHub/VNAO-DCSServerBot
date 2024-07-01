@@ -13,15 +13,15 @@ Examples:
 ```yaml
 DEFAULT:
   startup_delay: 10                               # delay in seconds between the startup of each DCS instance (default: 10)
-  warn:                                           # warn times before a restart / shutdown
+  warn:                                           # warn times before a restart / shutdown (see alternative format below)
     text: '!!! {item} will {what} in {when} !!!'  # Message to be displayed as a popup in DCS. These variables can be used in your own message. 
     times:                                        # List of times when a message will be displayed
     - 600
     - 300
     - 60
     - 10
-DCS.openbeta_server:                              
-  schedule:                                       # Server "DCS.openbeta_server" will run 24x7
+DCS.release_server:                              
+  schedule:                                       # Server "DCS.release_server" will run 24x7
     00-24: YYYYYYY
 instance2:
   schedule:                                       # Server "instance2" will run every day from 0h-12h local time (LT)
@@ -53,8 +53,18 @@ mission:
 
 | Parameter       | Description                                                                                                                                                                                                                                                                                                      |
 |-----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| times           | List of seconds, when a warning should be issued.                                                                                                                                                                                                                                                                |
+| times           | List of seconds, when a warning should be issued or alternatively a dictionary with seconds and specific warn texts.                                                                                                                                                                                             |
 | text            | A customizable message that will be sent to the users when a restart is pending.<br/>{item} will be replaced with either "server" or "mission", depending on what's happening.<br/>{what} will be replaced with what is happening (restart, shutdown, rotate)<br/>{when} will be replaced with the time to wait. |
+
+```yaml
+  # Alternative format for warn, e. g. to display messages in your own language
+  warn:
+    times:
+      600: Внимание сервер будет перезапущен через 10 минут! 
+      300: До перезапуска 5 минут!
+      60: Минутная готовность!
+      10: Сервер перезапускается!
+```
 
 ### Section "schedule"
 
@@ -66,14 +76,15 @@ See the above examples for a better understanding on how it works.
 
 ### Section "restart"
 
-| Parameter        | Description                                                                                                                                                                                                                                                                                                                |
-|------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| method           | One of **restart**, **restart_with_shutdown**, **rotate** or **shutdown**.<br/>- "restart" will restart the current mission,<br/>- "restart_with_shutdown" will do the same but shutdown the whole server<br/>- "shutdown" will only shutdown the server<br/>- "rotate" will launch the next mission in the mission list.  |
-| mission_time     | Time in minutes (according to the mission time passed) when the mission has to be restarted.                                                                                                                                                                                                                               |
-| max_mission_time | Time in minutes (according to the mission time passed) when the mission has to be restarted, even if people are in.                                                                                                                                                                                                        |
-| local_times      | List of times in the format HH24:MM, when the mission should be restated or rotated (see method).                                                                                                                                                                                                                          |
-| populated        | If **false**, the mission will be restarted / rotated only, if no player is in (default: true).                                                                                                                                                                                                                            |
-| mission_end      | Only apply the method on mission end (usually in combination with restart_with_shutdown).                                                                                                                                                                                                                                  |
+| Parameter        | Description                                                                                                                                                                                                                                                                                                               |
+|------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| method           | One of **restart**, **restart_with_shutdown**, **rotate** or **shutdown**.<br/>- "restart" will restart the current mission,<br/>- "restart_with_shutdown" will do the same but shutdown the whole server<br/>- "shutdown" will only shutdown the server<br/>- "rotate" will launch the next mission in the mission list. |
+| mission_time     | Time in minutes (according to the mission time passed) when the mission has to be restarted.                                                                                                                                                                                                                              |
+| max_mission_time | Time in minutes (according to the mission time passed) when the mission has to be restarted, even if people are in.                                                                                                                                                                                                       |
+| real_time        | Time in minutes since the start of your server (not necessarily your mission, if that is paused for instance), when a restart should happen. Only works with restart_with_shutdown.                                                                                                                                       |
+| local_times      | List of times in the format HH24:MM, when the mission should be restated or rotated (see method).                                                                                                                                                                                                                         |
+| populated        | If **false**, the mission will be restarted / rotated only, if no player is in (default: true).                                                                                                                                                                                                                           |
+| mission_end      | Only apply the method on mission end (usually in combination with restart_with_shutdown).                                                                                                                                                                                                                                 |
 
 ### on-commands
 
@@ -102,22 +113,30 @@ The following environment variables can be used in the "run" command:
 
 ## Discord Commands
 
-| Command             | Parameter                                | Channel       | Role      | Description                                                                                                                                                                      |
-|---------------------|------------------------------------------|---------------|-----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| /server list        |                                          | all           | DCS       | Lists all available servers.                                                                                                                                                     |
-| /server startup     | [maintenance] [mission] [run_extensions] | admin-channel | DCS Admin | Starts a dedicated DCS server process and optionally launches a specified mission (default is last one). Optional: don't set maintenance flag, don't run extensions.             |
-| /server shutdown    | [force] [maintenance]                    | admin-channel | DCS Admin | Shuts the dedicated DCS server process down.<br/>If force is used, no player check will be executed and no onShutdown command will be run. Optional: don't set maintenance flag. |
-| /server start       |                                          | admin-channel | DCS Admin | Starts a stopped DCS server.                                                                                                                                                     |
-| /server stop        |                                          | admin-channel | DCS Admin | Stops a DCS server.                                                                                                                                                              |
-| /server maintenance |                                          | admin-channel | DCS Admin | Sets the servers maintenance mode.                                                                                                                                               |
-| /server clear       |                                          | admin-channel | DCS Admin | Clears the maintenance state of a server.                                                                                                                                        |
-| /server password    |                                          | admin-channel | DCS Admin | Sets a new server or [coalition](../../COALITIONS.md) password.                                                                                                                  |
-| /server config      |                                          | admin-channel | DCS Admin | Changes the configuration of a server, like name, password, max players.                                                                                                         |
-| /server rename      |                                          | admin-channel | DCS Admin | Rename the respective DCS server. Handle with care!                                                                                                                              |
-| /server migrate     | instance                                 | admin-channel | DCS Admin | WIP: Migrate a server to another instance (maybe even node).                                                                                                                     |
+| Command                | Parameter                                | Channel       | Role      | Description                                                                                                                                                                      |
+|------------------------|------------------------------------------|---------------|-----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| /scheduler maintenance |                                          | admin-channel | DCS Admin | Sets the servers maintenance mode.                                                                                                                                               |
+| /scheduler clear       |                                          | admin-channel | DCS Admin | Clears the maintenance state of a server.                                                                                                                                        |
+| /server list           |                                          | all           | DCS       | Lists all available servers.                                                                                                                                                     |
+| /server startup        | [maintenance] [mission] [run_extensions] | admin-channel | DCS Admin | Starts a dedicated DCS server process and optionally launches a specified mission (default is last one). Optional: don't set maintenance flag, don't run extensions.             |
+| /server shutdown       | [force] [maintenance]                    | admin-channel | DCS Admin | Shuts the dedicated DCS server process down.<br/>If force is used, no player check will be executed and no onShutdown command will be run. Optional: don't set maintenance flag. |
+| /server start          |                                          | admin-channel | DCS Admin | Starts a stopped DCS server.                                                                                                                                                     |
+| /server stop           |                                          | admin-channel | DCS Admin | Stops a DCS server.                                                                                                                                                              |
+| /server password       |                                          | admin-channel | DCS Admin | Sets a new server or [coalition](../../COALITIONS.md) password.                                                                                                                  |
+| /server config         |                                          | admin-channel | DCS Admin | Changes the configuration of a server, like name, password, max players.                                                                                                         |
+| /server rename         |                                          | admin-channel | DCS Admin | Rename the respective DCS server. Handle with care!                                                                                                                              |
+| /server migrate        | instance                                 | admin-channel | DCS Admin | WIP: Migrate a server to another instance (maybe even node).                                                                                                                     |
+| /server timeleft       | server                                   | all           | DCS       | Shows the time until the next scheduled restart.                                                                                                                                 |
 
 > ⚠️ **Attention!**<br>
 > If a server gets started or stopped manually (using `/server startup` or `/server shutdown`), it will be put into 
 > "maintenance" mode unless specified otherwise with the optional maintenance parameter. To clear this and give the 
 > control back to the scheduler, use `/server clear`.<br>
 > You can put a server into maintenance mode manually, by using `/server maintenance`.
+
+## In-Game Chat Commands
+| Command      | Parameter | Role      | Description                                  |
+|--------------|-----------|-----------|----------------------------------------------|
+| -maintenance |           | DCS Admin | Enables maintenance mode for this server.    |
+| -clear       |           | DCS Admin | Clears the maintenance mode for this server. |
+| -timeleft    |           | all       | Displays the time until the next restart.    |

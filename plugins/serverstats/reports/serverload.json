@@ -1,13 +1,7 @@
 {
   "color": "blue",
   "title": "Server Load ({period})",
-  "description": "Host: {node}",
   "input": [
-    {
-      "name": "period",
-      "range": ["", "hour", "day", "week", "month"],
-      "default": "hour"
-    },
     {
       "name": "ruler_length",
       "value": 27
@@ -23,6 +17,9 @@
   },
   "elements":
   [
+    {
+      "class": "plugins.serverstats.serverstats.ServerLoadHeader"
+    },
     {
       "type": "Graph",
       "params":

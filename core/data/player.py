@@ -1,11 +1,13 @@
 from __future__ import annotations
+
 import discord
+
 from contextlib import closing
 from core import utils
 from core.data.dataobject import DataObject, DataObjectFactory
 from core.data.const import Side, Coalition
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 from core.services.registry import ServiceRegistry
 
@@ -17,18 +19,19 @@ __all__ = ["Player"]
 
 
 @dataclass
-@DataObjectFactory.register("Player")
+@DataObjectFactory.register()
 class Player(DataObject):
     server: Server = field(compare=False)
     id: int = field(compare=False)
-    name: str = field(compare=False)
     active: bool = field(compare=False)
     side: Side = field(compare=False)
     ucid: str
-    banned: bool = field(compare=False, init=False)
+    ipaddr: str
+    banned: bool = field(compare=False, default=False, init=False)
     slot: int = field(compare=False, default=0)
     sub_slot: int = field(compare=False, default=0)
     unit_callsign: str = field(compare=False, default='')
+    unit_id: int = field(compare=False, default=0)
     unit_name: str = field(compare=False, default='')
     unit_display_name: str = field(compare=False, default='')
     unit_type: str = field(compare=False, default='')
@@ -42,8 +45,10 @@ class Player(DataObject):
     bot: DCSServerBot = field(compare=False, init=False)
 
     def __post_init__(self):
+        from services import BotService
+
         super().__post_init__()
-        self.bot = ServiceRegistry.get("Bot").bot
+        self.bot = ServiceRegistry.get(BotService).bot
         if self.id == 1:
             self.active = False
             return
@@ -52,9 +57,11 @@ class Player(DataObject):
                 with closing(conn.cursor()) as cursor:
                     cursor.execute("""
                         SELECT p.discord_id, CASE WHEN b.ucid IS NOT NULL THEN TRUE ELSE FALSE END AS banned, 
-                               p.manual, c.coalition, p.watchlist, p.vip 
+                               p.manual, c.coalition, 
+                               CASE WHEN w.player_ucid IS NOT NULL THEN TRUE ELSE FALSE END AS watchlict, p.vip 
                         FROM players p LEFT OUTER JOIN bans b ON p.ucid = b.ucid 
                         LEFT OUTER JOIN coalitions c ON p.ucid = c.player_ucid 
+                        LEFT OUTER JOIN watchlist w ON p.ucid = w.player_ucid
                         WHERE p.ucid = %s 
                         AND COALESCE(b.banned_until, (now() AT TIME ZONE 'utc')) >= (now() AT TIME ZONE 'utc')
                     """, (self.ucid, ))
@@ -69,6 +76,15 @@ class Player(DataObject):
                             self.coalition = Coalition(row[3])
                         self._watchlist = row[4]
                         self._vip = row[5]
+                    else:
+                        rules = self.server.locals.get('rules')
+                        if rules:
+                            cursor.execute("""
+                                INSERT INTO messages (sender, player_ucid, message, ack) 
+                                VALUES (%s, %s, %s, %s)
+                            """, (self.server.locals.get('server_user', 'Admin'), self.ucid, rules,
+                                  self.server.locals.get('accept_rules_on_join', False)))
+
                     cursor.execute("""
                         INSERT INTO players (ucid, discord_id, name, last_seen) 
                         VALUES (%s, -1, %s, (now() AT TIME ZONE 'utc')) 
@@ -96,17 +112,14 @@ class Player(DataObject):
     @member.setter
     def member(self, member: discord.Member) -> None:
         if member != self._member:
-            with self.pool.connection() as conn:
-                with conn.transaction():
-                    conn.execute('UPDATE players SET discord_id = %s WHERE ucid = %s',
-                                 (member.id if member else -1, self.ucid))
+            self.update_member(member)
             self._member = member
-            self.server.send_to_dcs({
-                'command': 'uploadUserRoles',
-                'id': self.id,
-                'ucid': self.ucid,
-                'roles': [x.id for x in self._member.roles] if self._member else []
-            })
+
+    def update_member(self, member: discord.Member) -> None:
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute('UPDATE players SET discord_id = %s WHERE ucid = %s',
+                             (member.id if member else -1, self.ucid))
 
     @property
     def verified(self) -> bool:
@@ -114,21 +127,26 @@ class Player(DataObject):
 
     @verified.setter
     def verified(self, verified: bool) -> None:
+        if verified == self._verified:
+            return
+        self.update_verified(verified)
+        self._verified = verified
+
+    def update_verified(self, verified: bool) -> None:
         with self.pool.connection() as conn:
             with conn.transaction():
                 conn.execute('UPDATE players SET manual = %s WHERE ucid = %s', (verified, self.ucid))
-        self._verified = verified
+                if verified:
+                    # delete all old automated links (this will delete the token also)
+                    conn.execute("DELETE FROM players WHERE ucid = %s AND manual = FALSE", (self.ucid,))
+                    conn.execute("DELETE FROM players WHERE discord_id = %s AND length(ucid) = 4",
+                                 (self.member.id,))
+                    conn.execute("UPDATE players SET discord_id = -1 WHERE discord_id = %s AND manual = FALSE",
+                                 (self.member.id,))
 
     @property
     def watchlist(self) -> bool:
         return self._watchlist
-
-    @watchlist.setter
-    def watchlist(self, watchlist: bool):
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                conn.execute('UPDATE players SET watchlist = %s WHERE ucid = %s', (watchlist, self.ucid))
-        self._watchlist = watchlist
 
     @property
     def vip(self) -> bool:
@@ -136,10 +154,13 @@ class Player(DataObject):
 
     @vip.setter
     def vip(self, vip: bool):
+        self.update_vip(vip)
+        self._vip = vip
+
+    def update_vip(self, vip: bool) -> None:
         with self.pool.connection() as conn:
             with conn.transaction():
                 conn.execute('UPDATE players SET vip = %s WHERE ucid = %s', (vip, self.ucid))
-        self._vip = vip
 
     @property
     def coalition(self) -> Coalition:
@@ -156,53 +177,56 @@ class Player(DataObject):
             side = Side.NEUTRAL
         else:
             side = Side.SPECTATOR
-        self.server.send_to_dcs({
+        self.bot.loop.create_task(self.server.send_to_dcs({
             "command": "setUserCoalition",
             "ucid": self.ucid,
             "coalition": side.value
-        })
+        }))
 
     @property
     def display_name(self) -> str:
         return utils.escape_string(self.name)
 
-    def update(self, data: dict):
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                with closing(conn.cursor()) as cursor:
-                    if 'id' in data:
-                        # if the ID has changed (due to reconnect), we need to update the server list
-                        if self.id != data['id']:
-                            del self.server.players[self.id]
-                            self.server.players[data['id']] = self
-                            self.id = data['id']
-                    if 'active' in data:
-                        self.active = data['active']
-                    if 'name' in data and self.name != data['name']:
-                        self.name = data['name']
-                        cursor.execute('UPDATE players SET name = %s WHERE ucid = %s', (self.name, self.ucid))
-                    if 'side' in data:
-                        self.side = Side(data['side'])
-                    if 'slot' in data:
-                        self.slot = int(data['slot'])
-                    if 'sub_slot' in data:
-                        self.sub_slot = data['sub_slot']
-                    if 'unit_callsign' in data:
-                        self.unit_callsign = data['unit_callsign']
-                    if 'unit_name' in data:
-                        self.unit_name = data['unit_name']
-                    if 'unit_type' in data:
-                        self.unit_type = data['unit_type']
-                    if 'group_name' in data:
-                        self.group_name = data['group_name']
-                    if 'group_id' in data:
-                        self.group_id = data['group_id']
-                    if 'unit_display_name' in data:
-                        self.unit_display_name = data['unit_display_name']
-                    cursor.execute("""
-                        UPDATE players SET last_seen = (now() AT TIME ZONE 'utc') 
-                        WHERE ucid = %s
-                    """, (self.ucid, ))
+    async def update(self, data: dict):
+        async with self.apool.connection() as conn:
+            async with conn.transaction():
+                if 'id' in data:
+                    # if the ID has changed (due to reconnect), we need to update the server list
+                    if self.id != data['id']:
+                        del self.server.players[self.id]
+                        self.server.players[data['id']] = self
+                        self.id = data['id']
+                if 'active' in data:
+                    self.active = data['active']
+                if 'name' in data and self.name != data['name']:
+                    self.name = data['name']
+                    await conn.execute('UPDATE players SET name = %s WHERE ucid = %s', (self.name, self.ucid))
+                if 'side' in data:
+                    self.side = Side(data['side'])
+                if 'slot' in data:
+                    self.slot = int(data['slot'])
+                if 'sub_slot' in data:
+                    self.sub_slot = data['sub_slot']
+                if 'unit_callsign' in data:
+                    self.unit_callsign = data['unit_callsign']
+                if 'unit_id' in data:
+                    self.unit_id = data['unit_id']
+                if 'unit_name' in data:
+                    self.unit_name = data['unit_name']
+                if 'unit_type' in data:
+                    self.unit_type = data['unit_type']
+                if 'group_name' in data:
+                    self.group_name = data['group_name']
+                if 'group_id' in data:
+                    self.group_id = data['group_id']
+                if 'unit_display_name' in data:
+                    self.unit_display_name = data['unit_display_name']
+                if 'ipaddr' in data:
+                    self.ipaddr = data['ipaddr']
+                await conn.execute("""
+                    UPDATE players SET last_seen = (now() AT TIME ZONE 'utc') 
+                    WHERE ucid = %s
+                """, (self.ucid, ))
 
     def has_discord_roles(self, roles: list[str]) -> bool:
         valid_roles = []
@@ -210,23 +234,23 @@ class Player(DataObject):
             valid_roles.extend(self.bot.roles[role])
         return self.verified and self._member is not None and utils.check_roles(set(valid_roles), self._member)
 
-    def sendChatMessage(self, message: str, sender: str = None):
+    async def sendChatMessage(self, message: str, sender: str = None):
         for msg in message.split('\n'):
-            self.server.send_to_dcs({
+            await self.server.send_to_dcs({
                 "command": "sendChatMessage",
                 "to": self.id,
                 "from": sender,
                 "message": msg
             })
 
-    def sendUserMessage(self, message: str, timeout: Optional[int] = -1):
-        [self.sendChatMessage(msg) for msg in message.splitlines()]
-        self.sendPopupMessage(message, timeout)
+    async def sendUserMessage(self, message: str, timeout: Optional[int] = -1):
+        [await self.sendChatMessage(msg) for msg in message.splitlines()]
+        await self.sendPopupMessage(message, timeout)
 
-    def sendPopupMessage(self, message: str, timeout: Optional[int] = -1, sender: str = None):
+    async def sendPopupMessage(self, message: str, timeout: Optional[int] = -1, sender: str = None):
         if timeout == -1:
             timeout = self.server.locals.get('message_timeout', 10)
-        self.server.send_to_dcs({
+        await self.server.send_to_dcs({
                 "command": "sendPopupMessage",
                 "from": sender,
                 "to": "unit",
@@ -235,10 +259,62 @@ class Player(DataObject):
                 "time": timeout
         })
 
-    def playSound(self, sound: str):
-        self.server.send_to_dcs({
+    async def playSound(self, sound: str):
+        await self.server.send_to_dcs({
             "command": "playSound",
             "to": "unit",
             "id": self.unit_name,
             "sound": sound
         })
+
+    async def add_role(self, role: Union[str, int]):
+        if not self.member or not role:
+            return
+        try:
+            _role = self.bot.get_role(role)
+            if not _role:
+                self.log.error(f'Role {role} not found!')
+                return
+            await self.member.add_roles(_role)
+        except discord.Forbidden:
+            await self.bot.audit('permission "Manage Roles" missing.', user=self.bot.member)
+
+    async def remove_role(self, role: Union[str, int]):
+        if not self.member or not role:
+            return
+        try:
+            _role = self.bot.get_role(role)
+            if not _role:
+                self.log.error(f'Role {role} not found!')
+                return
+            await self.member.remove_roles(_role)
+        except discord.Forbidden:
+            await self.bot.audit('permission "Manage Roles" missing.', user=self.bot.member)
+
+    def check_exemptions(self, exemptions: Union[dict, list]) -> bool:
+        def _check_exemption(exemption: dict) -> bool:
+            if 'ucid' in exemption:
+                if not isinstance(exemption['ucid'], list):
+                    ucids = [exemption['ucid']]
+                else:
+                    ucids = exemption['ucid']
+                if self.ucid in ucids:
+                    return True
+            if 'discord' in exemption:
+                if not self.member:
+                    return False
+                if not isinstance(exemption['discord'], list):
+                    roles = [exemption['discord']]
+                else:
+                    roles = exemption['discord']
+                if utils.check_roles(roles, self.member):
+                    return True
+            return False
+
+        if isinstance(exemptions, list):
+            ret = False
+            for exemption in exemptions:
+                ret = _check_exemption(exemption) | ret
+        else:
+            ret = _check_exemption(exemptions)
+        return ret

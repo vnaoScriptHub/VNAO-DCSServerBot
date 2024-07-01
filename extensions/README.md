@@ -8,7 +8,7 @@ them in your server embed (LotAtc) to completely starting and stopping external 
 > about these solutions and I really appreciate that someone put a lot of time in to make them what they
 > are today.<br>
 > Nevertheless, I am not responsible for them. Neither for any bugs, nor for their proper functionality. The developers
-> usually either have their own Discord servers, where you can ask for support or they have the option to raise an 
+> usually either have their own Discord servers, where you can ask for support, or they have the option to raise an 
 > issue in their GitHubs.<br>
 > So please - if you see any issues in these solutions, contact the developers and ask for help.
 
@@ -21,9 +21,25 @@ example later.
 This is not really an external solution supported by DCSServerBot, but my own one, which allows you to change your 
 missions prior to the server startup.<br>
 You can change more or less anything in the mission itself, like weather, mission parameters and even amend units, if
-you like. The common usecase for people is to use it to change the weather on a timed or random basis.
+you like. The common use-case for people is to use it to change the weather on a timed or random basis.
 
 As MizEdit is a very powerful solution, I decided to donate it a separate doc page, which you can reach [here](./MizEdit.md).
+
+### OvGME
+This little extension checks, if you have any requiredModules in your miz file and shows them in the server status
+embed in Discord. Nice addition for your users, if you show them what to install to fly on your server.
+
+The configuration is as simple as it sounds:
+```yaml
+MyNode:
+  # [...]
+  instances:
+    DCS.release_server:
+      # [...]
+      extensions:
+        OvGME:
+          enabled: true
+```
 
 ### DCS Voice Chat
 If you want to use the built-in Voice Chat system of DCS, you can use the VoiceChat extension.
@@ -31,7 +47,7 @@ If you want to use the built-in Voice Chat system of DCS, you can use the VoiceC
 MyNode:
   # [...]
   instances:
-    DCS.openbeta_server:
+    DCS.release_server:
       # [...]
       extensions:
         VoiceChat:
@@ -56,25 +72,30 @@ MyNode:
       autoupdate: true
   # [...]
   instances:
-    DCS.openbeta_server:
+    DCS.release_server:
       # [...]
       extensions:
         SRS:
-          config: '%USERPROFILE%\Saved Games\DCS.openbeta_server\Config\SRS.cfg'
+          config: '%USERPROFILE%\Saved Games\DCS.release_server\Config\SRS.cfg'
           host: 127.0.0.1
           port: 5002
+          minimized: true     # start SRS minimized (default: true)
           autoconnect: true   # install the appropriate DCS-SRS-AutoConnectGameGUI.lua, default: true
           awacs: true
           blue_password: blue
           red_password: red
           autostart: true     # optional: if you manage your SRS servers outside of DCSSB, set that to false
+          always_on: true     # start SRS as soon as possible  (includes no_shutdown: true)
           no_shutdown: true   # optional: don't shut down SRS on mission end (default: false)
+          srs_message_prefix: 'SRS Running @ '        # optional: overwrite the message prefix
+          srs_nudge_message: 'Optional nudge message' # optional: overwrite the existing nudge message
+          
 ```
 You need one entry in the node section, pointing to your DCS-SRS installation and one in every instance section, 
 where you want to use SRS with. The next time the bot starts your server, it will auto-launch SRS and take care of it.
 
 __Optional__ parameters (will change server.cfg if necessary):</br>
-* **autoupdate** If true, SRS will check for updates and update itself. You need to run the bot as Admin to do so.
+* **autoupdate** If true, SRS will check for updates and update itself.
 * **host** The hostname or IP to be used in your DCS-SRS-AutoConnectGameGUI.lua. The bot will replace it in there.
 * **port** SRS port (default: 5002)
 * **awacs** AWACS mode
@@ -82,6 +103,8 @@ __Optional__ parameters (will change server.cfg if necessary):</br>
 * **red_password** AWACS mode, password red.
 * **autostart** If true, the SRS server will be auto-started (default).
 
+> ⚠️ **Attention!**<br>
+> You need to disable User-Access-Control (UAC) to use SRS-autoupdate.
 
 ### Tacview
 Many servers run [Tacview](https://www.tacview.net/) to help people analyse their flight path, weapons employment and 
@@ -99,13 +122,13 @@ MyNode:
       tacviewExportPath: '%USERPROFILE%\Documents\Tacview'
   # [...]
   instances:
-    DCS.openbeta_server:
+    DCS.release_server:
       # [...]
       extensions:
         Tacview:
           show_passwords: false  # hide passwords in your server status embed (default: true)
           host: 127.0.0.1        # Tacview host (default)
-          log: "%USERPROFILE%\\Saved Games\\DCS.openbeta_server\\Logs\tacview.log"
+          log: "%USERPROFILE%\\Saved Games\\DCS.release_server\\Logs\tacview.log" # Only needed, if you export tacview logs to a different file.
           tacviewRealTimeTelemetryPort: 42674  # default
           tacviewRealTimeTelemetryPassword: '' # default
           tacviewRemoteControlPort: 42675      # default
@@ -129,13 +152,14 @@ To delete old tacview files, checkout the [Cleanup](../services/cleanup/README.m
 ### LotAtc
 Another famous extension for DCS is [LotAtc](https://www.lotatc.com/) by D'Art. If you think about any kind of proper
 GCI or ATC work, there is no way around it. It perfectly integrates with DCS and DCS-SRS.<br/>
-DCSServerBot can detect if it is there and enabled, but that's about it. You'll get a notification in your servers
-status embed about ports and - if you like - passwords and the version of LotAtc printed in the footer.
+You'll get a notification in your servers status embed about ports and - if you like - passwords and the version of 
+LotAtc printed in the footer. If a GCI gets active on your server, players of the respective coalition will be informed
+via the in-game chat and a popup. Same if the GCI leaves their slot again.
 ```yaml
 MyNode:
   # [...]
   instances:
-    DCS.openbeta_server:
+    DCS.release_server:
       # [...]
       extensions:
         LotAtc:
@@ -156,7 +180,7 @@ extension like with all others:
 MyNode:
   # [...]
   instances:
-    DCS.openbeta_server:
+    DCS.release_server:
       # [...]
       extensions:
         DSMC:
@@ -189,7 +213,7 @@ MyNode:
       url: https://myfancyhost.com  # optional: show a different host instead of the servers external IP
   # [...]
   instances:
-    DCS.openbeta_server:
+    DCS.release_server:
       # [...]
       extensions:
         Sneaker:
@@ -212,7 +236,7 @@ MyNode:
       installation: '%USERPROFILE%\Documents\realweather_v1.9.0-rc2'
   # [...]
   instances:
-    DCS.openbeta_server:
+    DCS.release_server:
       # [...]
       extensions:
         RealWeather:
@@ -220,12 +244,16 @@ MyNode:
           debug: true     # see outputs of RealWeather, default: false
           metar:
             icao: URMM
+            runway-elevation: 50
+            add-to-brief: true
           options:
             update-time: true
             update-weather: true
             wind:
-              minimum: -1
-              maximum: -1
+              minimum: 0
+              maximum: 5
+              gust-minimum: 0
+              gust-maximum: 10
               stability: 0.143
             clouds:
               disallowed-presets:
@@ -233,11 +261,23 @@ MyNode:
                 - RainyPreset1
                 - RainyPreset2
                 - RainyPreset3
-            fog-allowed: true
-            dust-allowed: true
+            fog:
+              enabled: true
+              thickness-minimum: 0
+              thickness-maximum: 100
+              visibility-minimum: 1000
+              visibility-maximum: 4000
+            dust:
+              enabled: true
+              visibility-minimum: 300
+              visibility-maximum: 2000
 ```
 You can find a list of supported parameters in the config.json provided by DCS-real-weather.<br>
-**DCSServerBot only supports DCS Real Weather Updater versions from 1.9.0 upwards.**
+> ⚠️ **Attention!**<br>
+> DCSServerBot only supports DCS Real Weather Updater versions from 1.9.0 upwards.
+> 
+> If you want to set a custom ICAO code (URMM in this case) per mission, you can name your mission like so:<br>
+> `MyFancyMission_ICAO_URMM_whatsoever.miz`
 
 ### Lardoon
 [Lardoon](https://github.com/b1naryth1ef/lardoon) is another web-server-based application that provides a nice search 
@@ -256,18 +296,19 @@ MyNode:
       url: https://myfancyhost.com  # Alternate hostname to be displayed in your status embed 
   # [...]
   instances:
-    DCS.openbeta_server:
+    DCS.release_server:
       # [...]
       extensions:
         Lardoon:
           enabled: true
-          debug: true               # Show the sneaker console output in the DCSSB console. Default = false
+          debug: true               # Show the Lardoon console output in the DCSSB console. Default = false
+          tacviewExportPath: 'G:\My Drive\Tacview Files'  # Alternative drive for tacview files (default: auto-detect from Tacview)
 ```
 Don't forget to add some kind of security before exposing services like that to the outside world, with for instance
 a nginx reverse proxy.</br>
 If you plan to build Lardoon on your own, I'd recommend the fork of [Team LimaKilo](https://github.com/team-limakilo/lardoon).
 
-### DCS Olympus
+### DCS Olympus (v1.0.4 and above, for v1.0.3 see below)
 [DCS Olympus](https://github.com/Pax1601/DCSOlympus) is a free and open-source mod for DCS that enables dynamic 
 real-time control through a map interface. It is a mod that needs to be installed into your servers. Best you can do
 is to download the latest ZIP file from [here](https://github.com/Pax1601/DCSOlympus/releases/latest) and provide it to the [OvGME](../services/ovgme/README.md) service like so:
@@ -294,12 +335,65 @@ MyNode:
       nodejs: '%ProgramFiles%\nodejs'
   # [...]
   instances:
-    DCS.openbeta_server:
+    DCS.release_server:
       # [...]
       extensions:
         Olympus:
           debug: true                     # Show the Olympus console in the DCSSB console, default = false
-          url: http://myfancyurl:3000/   # optional: your own URL, if available
+          show_passwords: true            # show passwords in your server status embed (default: false)
+          url: http://myfancyurl:3000/    # optional: your own URL, if available
+          backend:
+            port: 3001                    # server port for DCS Olympus internal communication (needs to be unique)                   
+          authentication:
+            gameMasterPassword: secret    # Game Master password
+            blueCommanderPassword: blue   # Blue Tactical Commander password
+            redCommanderPassword: red     # Red Tactical Commander password
+          frontend:
+            path: '%USERPROFILE%\Saved Games\Olympus\frontend' # Optional: path to the Olympus frontend. This is only needed if you are using the official installer. OVGME users don't need this.
+            port: 3000                    # Port where DCS Olympus listens for client access (needs to be unique)
+    instance2:
+      # [...]
+      extensions:
+        Olympus:
+          enabled: false                  # Don't enable DCS Olympus on your instance2
+```
+> ⚠️ **Attention!**<br>
+> You need to forward the frontend port from your router to the PC running DCS and DCS Olympus.
+
+### DCS Olympus (v1.0.3)
+[DCS Olympus](https://github.com/Pax1601/DCSOlympus) is a free and open-source mod for DCS that enables dynamic 
+real-time control through a map interface. It is a mod that needs to be installed into your servers. Best you can do
+is to download the latest ZIP file from [here](https://github.com/Pax1601/DCSOlympus/releases/latest) and provide it to the [OvGME](../services/ovgme/README.md) service like so:
+```yaml
+DEFAULT:
+  SavedGames: '%USERPROFILE%\Documents\OvGME\SavedGames'
+  RootFolder: '%USERPROFILE%\Documents\OvGME\RootFolder'
+DCS_MERCS:
+  packages:
+  - name: DCSOlympus
+    version: latest
+    source: SavedGames
+```
+To use the DCS Olympus client, you need [Node.js](https://nodejs.org/dist/v20.10.0/node-v20.10.0-x64.msi) installed.
+Click on the link, download and install it. Remember the installation location, as you need to provide it in the 
+configuration.
+
+Then you can add the DCS Olympus extension like so to your nodes.yaml:
+```yaml
+MyNode:
+  # [...]
+  extensions:
+    Olympus:
+      nodejs: '%ProgramFiles%\nodejs'
+  # [...]
+  instances:
+    DCS.release_server:
+      # [...]
+      extensions:
+        Olympus:
+          debug: true                     # Show the Olympus console in the DCSSB console, default = false
+          show_passwords: true            # show passwords in your server status embed (default: false)
+          url: http://myfancyurl:3000/    # optional: your own URL, if available
           server:
             address: '*'                  # your bind address. * = 0.0.0.0, use localhost for local only setups
             port: 3001                    # server port for DCS Olympus internal communication (needs to be unique)                   
@@ -329,12 +423,30 @@ extension:
 MyNode:
   # [...]
   instances:
-    DCS.openbeta_server:
+    DCS.release_server:
       # [...]
       extensions:
         gRPC:
           enabled: true
           port: 50051     # you can set any configuration parameter here, that will be replaced in your dcs-grpc.lua file.
+```
+
+### Pretense
+[Pretense](https://github.com/Dzsek/pretense) is a dynamic campaign system built by Dzsek. Unfortunately he dropped
+the development of it lately, but it is still in use by many and great missions to run on your servers. That is why
+I decided to not drop the support for now in DCSServerBot.<br>
+The main part happens in the [Pretense](../plugins/pretense/README.md) plugin, where you can run commands and configure
+specific statistic displays. But you can also use this small extension to either display your users which version of
+Pretense you are using and to have a very basic configuration of it. Just add some lines to your nodes.yaml like so:
+```yaml
+MyNode:
+  # [...]
+  instances:
+    DCS.release_server:
+      # [...]
+      extensions:
+        Pretense:
+          randomize: true # puts a randomize.lua in your Missions\Saves directory. See the Pretense documentation for more.
 ```
 
 ### Write your own Extension!
@@ -361,9 +473,9 @@ class MyExtension(Extension):
         self.log.debug("Hello World!")
         return True
 
-    async def shutdown(self) -> bool:
+    def shutdown(self) -> bool:
         self.log.debug("Cya World!")
-        return await super().shutdown()
+        return super().shutdown()
 
     def is_running(self) -> bool:
         return True
@@ -391,7 +503,7 @@ MyNode:
       param2: bb
   # [...]
   instances:
-    DCS.openbeta_server:
+    DCS.release_server:
       # [...]
       extensions:
         mymodule.MyExtension:

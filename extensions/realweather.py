@@ -2,10 +2,11 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 
-from core import Extension, MizFile, utils, DEFAULT_TAG
-from typing import Optional, Tuple
+from core import Extension, MizFile, utils, DEFAULT_TAG, Server
+from typing import Optional
 
 
 class RealWeatherException(Exception):
@@ -13,6 +14,11 @@ class RealWeatherException(Exception):
 
 
 class RealWeather(Extension):
+
+    def __init__(self, server: Server, config: dict):
+        super().__init__(server, config)
+        self.lock = asyncio.Lock()
+
     @property
     def version(self) -> Optional[str]:
         return utils.get_windows_version(os.path.join(os.path.expandvars(self.config['installation']),
@@ -20,40 +26,67 @@ class RealWeather(Extension):
 
     def get_config(self, filename: str) -> dict:
         if 'terrains' in self.config:
-            miz = MizFile(self.node, filename)
+            miz = MizFile(filename)
             return self.config['terrains'].get(miz.theatre, self.config['terrains'].get(DEFAULT_TAG, {}))
         else:
             return self.config
 
-    async def beforeMissionLoad(self, filename: str) -> Tuple[str, bool]:
+    @staticmethod
+    def get_icao_code(filename: str) -> Optional[str]:
+        index = filename.find('ICAO_')
+        if index != -1:
+            return filename[index + 5:index + 9]
+        else:
+            return None
+
+    async def beforeMissionLoad(self, filename: str) -> tuple[str, bool]:
         rw_home = os.path.expandvars(self.config['installation'])
         tmpfd, tmpname = tempfile.mkstemp()
         os.close(tmpfd)
-        with open(os.path.join(rw_home, 'config.json'), mode='r', encoding='utf-8') as infile:
-            cfg = json.load(infile)
+        try:
+            with open(os.path.join(rw_home, 'config.json'), mode='r', encoding='utf-8') as infile:
+                cfg = json.load(infile)
+        except json.JSONDecodeError as ex:
+            raise RealWeatherException(f"Error while reading {os.path.join(rw_home, 'config.json')}: {ex}")
         config = self.get_config(filename)
         # create proper configuration
         for name, element in cfg.items():
             if name == 'files':
                 element['input-mission'] = filename
                 element['output-mission'] = tmpname
+                element['log'] = config.get('files', {}).get('log', 'logfile.log')
             elif name in config:
                 if isinstance(config[name], dict):
                     element |= config[name]
                 else:
                     cfg[name] = config[name]
+        icao = self.get_icao_code(filename)
+        if icao and icao != self.config.get('metar', {}).get('icao'):
+            cfg |= {
+                "metar": {
+                    "icao": icao
+                }
+            }
+            self.config['metar'] = {"icao": icao}
         cwd = await self.server.get_missions_dir()
         with open(os.path.join(cwd, 'config.json'), mode='w', encoding='utf-8') as outfile:
             json.dump(cfg, outfile, indent=2)
-        out = asyncio.subprocess.DEVNULL if not self.config.get('debug', False) else None
-        proc = await asyncio.create_subprocess_exec(os.path.join(rw_home, 'realweather.exe'), cwd=cwd,
-                                                    stdout=out, stderr=out)
-        rc = await proc.wait()
-        if rc != 0:
-            raise RealWeatherException(f"Error in RealWeather. Enable debug in your extension to see more.")
+
+        def run_subprocess():
+            process = subprocess.Popen([os.path.join(rw_home, 'realweather.exe')],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                self.log.error(stderr.decode('utf-8'))
+            if self.config.get('debug', False):
+                self.log.debug(stdout.decode('utf-8'))
+
+        async with self.lock:
+            await asyncio.to_thread(run_subprocess)
+
         # check if DCS Real Weather corrupted the miz file
         # (as the original author does not see any reason to do that on his own)
-        MizFile(self, tmpname)
+        await asyncio.to_thread(MizFile, tmpname)
         # mission is good, take it
         new_filename = utils.create_writable_mission(filename)
         shutil.copy2(tmpname, new_filename)
@@ -61,10 +94,15 @@ class RealWeather(Extension):
         return new_filename, True
 
     async def render(self, param: Optional[dict] = None) -> dict:
+        icao = self.config.get('metar', {}).get('icao')
+        if icao:
+            value = f'Metar: {icao}'
+        else:
+            value = 'enabled'
         return {
             "name": "RealWeather",
             "version": self.version,
-            "value": "enabled"
+            "value": value
         }
 
     def is_installed(self) -> bool:
@@ -91,7 +129,7 @@ class RealWeather(Extension):
             return False
         return True
 
-    async def shutdown(self) -> bool:
+    def shutdown(self) -> bool:
         return True
 
     def is_running(self) -> bool:

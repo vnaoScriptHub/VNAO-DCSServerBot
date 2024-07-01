@@ -1,6 +1,5 @@
 import discord
 
-from contextlib import closing
 from core import report
 from psycopg.rows import dict_row
 from typing import Optional
@@ -12,16 +11,17 @@ class HighscoreTrueSkill(report.GraphElement):
         sql = f"""
             SELECT DISTINCT p.discord_id, COALESCE(name, 'Unknown') AS name, t.skill_mu - 3 * t.skill_sigma AS value
             FROM players p, trueskill t
-            WHERE p.ucid = t.player_ucid AND skill_mu IS NOT NULL
+            WHERE p.ucid = t.player_ucid
             ORDER BY 3 DESC 
             LIMIT {limit}
         """
 
-        with self.pool.connection() as conn:
-            with closing(conn.cursor(row_factory=dict_row)) as cursor:
+        async with self.apool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cursor:
                 labels = []
                 values = []
-                for row in cursor.execute(sql):
+                await cursor.execute(sql)
+                async for row in cursor:
                     member = self.bot.guilds[0].get_member(row['discord_id']) if row['discord_id'] != '-1' else None
                     name = member.display_name if member else row['name']
                     labels.insert(0, name)

@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import builtins
+import hashlib
+import importlib
 import json
-import time
+import logging
 import luadata
 import os
+import pkgutil
 import re
+import secrets
 import shutil
 import string
 import tempfile
+import time
 import unicodedata
 
 # for eval
@@ -19,31 +26,31 @@ from croniter import croniter
 from datetime import datetime, timedelta, timezone
 from importlib import import_module
 from pathlib import Path
-from typing import Optional, Union, TYPE_CHECKING, Tuple, Generator, Iterable
+from typing import Optional, Union, TYPE_CHECKING, Generator, Iterable
 from urllib.parse import urlparse
 
 # ruamel YAML support
+from pykwalify.errors import SchemaError
 from ruamel.yaml import YAML
-from ruamel.yaml.parser import ParserError
-from ruamel.yaml.scanner import ScannerError
-
+from ruamel.yaml.error import MarkedYAMLError
 yaml = YAML()
 
 if TYPE_CHECKING:
-    from core import ServerProxy, DataObject
+    from core import ServerProxy, DataObject, Node
 
 __all__ = [
+    "parse_time",
     "is_in_timeframe",
     "is_match_daystate",
     "str_to_class",
     "format_string",
+    "sanitize_string",
     "convert_time",
     "format_time",
     "get_utc_offset",
     "format_period",
     "slugify",
     "alternate_parse_settings",
-    "get_all_servers",
     "get_all_players",
     "is_ucid",
     "get_presets",
@@ -51,12 +58,23 @@ __all__ = [
     "is_valid_url",
     "is_github_repo",
     "matches_cron",
+    "dynamic_import",
     "SettingsDict",
     "RemoteSettingsDict",
+    "tree_delete",
+    "hash_password",
     "evaluate",
     "for_each",
     "YAMLError"
 ]
+
+logger = logging.getLogger(__name__)
+
+
+def parse_time(time_str: str) -> datetime:
+    fmt, time_str = ('%H:%M', time_str.replace('24:', '00:')) \
+        if time_str.find(':') > -1 else ('%H', time_str.replace('24', '00'))
+    return datetime.strptime(time_str, fmt)
 
 
 def is_in_timeframe(time: datetime, timeframe: str) -> bool:
@@ -70,11 +88,6 @@ def is_in_timeframe(time: datetime, timeframe: str) -> bool:
     :return: True if the time falls within the timeframe, False otherwise.
     :rtype: bool
     """
-    def parse_time(time_str: str) -> datetime:
-        fmt, time_str = ('%H:%M', time_str.replace('24:', '00:')) \
-            if time_str.find(':') > -1 else ('%H', time_str.replace('24', '00'))
-        return datetime.strptime(time_str, fmt)
-
     pos = timeframe.find('-')
     if pos != -1:
         start_time = parse_time(timeframe[:pos])
@@ -126,7 +139,7 @@ def format_string(string_: str, default_: Optional[str] = None, **kwargs) -> str
     """
     class NoneFormatter(string.Formatter):
         def format_field(self, value, spec):
-            if value is None:
+            if not isinstance(value, bool) and not value:
                 spec = ''
                 value = default_ or ''
             elif isinstance(value, list):
@@ -139,9 +152,19 @@ def format_string(string_: str, default_: Optional[str] = None, **kwargs) -> str
 
     try:
         string_ = NoneFormatter().format(string_, **kwargs)
-    except KeyError:
+    except (KeyError, TypeError):
         string_ = ""
     return string_
+
+
+def sanitize_string(s: str) -> str:
+    # Replace single and double quotes, semicolons and backslashes
+    s = re.sub(r"[\"';\\]", "", s)
+
+    # Replace comment sequences
+    s = re.sub(r"--|/\*|\*/", "", s)
+
+    return s
 
 
 SECONDS_IN_DAY = 86400
@@ -158,8 +181,11 @@ def format_time_units(units, label_single, label_plural=None):
 def process_time(seconds, time_unit_seconds, retval, label_symbol, label_single, colon_format=False):
     units, seconds = calculate_time(time_unit_seconds, seconds)
     if units != 0:
-        if len(retval) and colon_format:
-            retval += ":"
+        if len(retval):
+            if colon_format:
+                retval += ":"
+            else:
+                retval += " "
         formatted_time = format_time_units(units, label_single) if not colon_format else f"{units:02d}{label_symbol}"
         retval += formatted_time
     return seconds, retval
@@ -190,7 +216,8 @@ def convert_time(seconds: int):
     :param seconds: The number of seconds to be converted into time representation.
     :return: The formatted string representation of time.
     """
-    return convert_time_and_format(int(seconds), True)
+    retval = convert_time_and_format(int(seconds), True)
+    return retval
 
 
 def format_time(seconds: int):
@@ -293,24 +320,8 @@ def alternate_parse_settings(path: str):
     return settings
 
 
-def get_all_servers(self) -> list[str]:
-    """
-    Get a list of all servers that have been seen in the past week.
-
-    :param self: The instance of the class.
-    :return: A list of server names.
-    """
-    with self.pool.connection() as conn:
-        return [
-            row[0] for row in conn.execute("""
-                SELECT server_name FROM instances 
-                WHERE last_seen > (DATE(now() AT TIME ZONE 'utc') - interval '1 week')
-            """)
-        ]
-
-
 def get_all_players(self, linked: Optional[bool] = None, watchlist: Optional[bool] = None,
-                    vip: Optional[bool] = None) -> list[Tuple[str, str]]:
+                    vip: Optional[bool] = None) -> list[tuple[str, str]]:
     """
     This method `get_all_players` returns a list of tuples containing the UCID and name of players from the database. Filtering can be optionally applied by providing values for the parameters
     * `linked`, `watchlist`, and `vip`.
@@ -325,16 +336,20 @@ def get_all_players(self, linked: Optional[bool] = None, watchlist: Optional[boo
     :return: A list of tuples containing the UCID and name of players from the database.
 
     """
-    sql = "SELECT ucid, name FROM players WHERE length(ucid) = 32"
+    sql = "SELECT p.ucid, p.name FROM players p{} WHERE length(p.ucid) = 32"
+    sub_sql = ""
     if watchlist:
-        sql += " AND watchlist IS NOT FALSE"
+        sub_sql = " JOIN watchlist w ON p.ucid = w.player_ucid"
+    elif watchlist is False:
+        sql += " AND p.ucid NOT IN (SELECT player_ucid FROM watchlist)"
     if vip:
-        sql += " AND vip IS NOT FALSE"
+        sql += " AND p.vip IS NOT FALSE"
     if linked is not None:
         if linked:
-            sql += " AND discord_id != -1"
+            sql += " AND p.discord_id != -1 AND p.manual IS TRUE"
         else:
-            sql += " AND discord_id = -1"
+            sql += " AND p.manual IS FALSE"
+    sql = sql.format(sub_sql)
     with self.pool.connection() as conn:
         return [(row[0], row[1]) for row in conn.execute(sql)]
 
@@ -347,14 +362,14 @@ def is_ucid(ucid: Optional[str]) -> bool:
     return ucid is not None and len(ucid) == 32 and ucid.isalnum() and ucid == ucid.lower()
 
 
-def get_presets() -> Iterable[str]:
+def get_presets(node: Node) -> Iterable[str]:
     """
     Return the set of non-hidden presets from the YAML files in the 'config' directory.
 
     :return: A set of non-hidden presets.
     """
     presets = set()
-    for file in Path('config').glob('presets*.yaml'):
+    for file in Path(node.config_dir).glob('presets*.yaml'):
         with open(file, mode='r', encoding='utf-8') as infile:
             presets |= set([
                 name for name, value in yaml.load(infile).items()
@@ -363,8 +378,9 @@ def get_presets() -> Iterable[str]:
     return presets
 
 
-def get_preset(name: str, filename: Optional[str] = None) -> Optional[dict]:
+def get_preset(node: Node, name: str, filename: Optional[str] = None) -> Optional[dict]:
     """
+    :param node: The node where the configuration is stored.
     :param name: The name of the preset to retrieve.
     :param filename: The optional filename of the preset file to search in. If not provided, it will search for preset files in the 'config' directory.
     :return: The dictionary containing the preset data if found, or None if the preset was not found.
@@ -379,7 +395,7 @@ def get_preset(name: str, filename: Optional[str] = None) -> Optional[dict]:
     if filename:
         return _read_presets_from_file(Path(filename), name)
     else:
-        for file in Path('config').glob('presets*.yaml'):
+        for file in Path(node.config_dir).glob('presets*.yaml'):
             preset = _read_presets_from_file(file, name)
             if preset:
                 return preset
@@ -439,6 +455,13 @@ def matches_cron(datetime_obj: datetime, cron_string: str):
     next_date = cron_job.get_next(datetime)
     prev_date = cron_job.get_prev(datetime)
     return datetime_obj == prev_date or datetime_obj == next_date
+
+
+def dynamic_import(package_name: str):
+    package = importlib.import_module(package_name)
+    for loader, module_name, is_pkg in pkgutil.walk_packages(package.__path__):
+        if is_pkg:
+            globals()[module_name] = importlib.import_module(f"{package_name}.{module_name}")
 
 
 class SettingsDict(dict):
@@ -554,21 +577,82 @@ class RemoteSettingsDict(dict):
                 "value": value
             }
         }
-        self.server.send_to_dcs(msg)
+        asyncio.create_task(self.server.send_to_dcs(msg))
 
 
-def evaluate(value: Union[str, int, float, bool], **kwargs) -> Union[str, int, float, bool]:
+def tree_delete(d: dict, key: str, debug: Optional[bool] = False):
+    """
+    Clears an element from nested structure (a mix of dictionaries and lists)
+    given a key in the form "root/element1/element2".
+    """
+    keys = key.split('/')
+    curr_element = d
+
+    try:
+        for key in keys[:-1]:
+            if isinstance(curr_element, dict):
+                curr_element = curr_element[key]
+            else:  # if it is a list
+                curr_element = curr_element[int(key)]
+    except KeyError:
+        return
+
+    if debug:
+        logger.debug("  " * len(keys) + f"|_ Deleting {keys[-1]}")
+
+    if isinstance(curr_element, dict):
+        if isinstance(curr_element[keys[-1]], dict):
+            curr_element[keys[-1]] = {}
+        elif isinstance(curr_element[keys[-1]], list):
+            curr_element[keys[-1]] = []
+        else:
+            del curr_element[keys[-1]]
+    else:  # if it's a list
+        curr_element.pop(int(keys[-1]))
+
+
+def hash_password(password: str) -> str:
+    # Generate an 11 character alphanumeric string
+    key = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(11))
+
+    # Create a 32 byte digest using the Blake2b hash algorithm
+    # with the password as the input and the key as the key
+    password_bytes = password.encode('utf-8')
+    key_bytes = key.encode('utf-8')
+    digest = hashlib.blake2b(password_bytes, key=key_bytes, digest_size=32).digest()
+
+    # Base64URL encode the resulting 32 byte digest
+    encoded_digest = base64.urlsafe_b64encode(digest).replace(b'=', b'').decode()
+
+    # Create a string with the salt and the Base64URL encoded digest separated by a ":"
+    hashed_password = key + ':' + encoded_digest
+
+    return hashed_password
+
+
+def evaluate(value: Union[str, int, float, bool, list, dict], **kwargs) -> Union[str, int, float, bool, list, dict]:
     """
     Evaluate the given value, replacing placeholders with keyword arguments if necessary.
 
+    :param debug: enable debug mode
     :param value: The value to evaluate. Can be a string, integer, float, or boolean.
     :param kwargs: Additional keyword arguments to replace placeholders in the value.
     :return: The evaluated value. Returns the input value if it is not a string or if it does not start with '$'.
              If the input value is a string starting with '$', it will be evaluated with placeholders replaced by keyword arguments.
     """
-    if isinstance(value, (int, float, bool)) or not value.startswith('$'):
-        return value
-    return eval(format_string(value[1:], **kwargs))
+    def _evaluate(value, **kwargs):
+        if isinstance(value, (int, float, bool)) or not value.startswith('$'):
+            return value
+        value = format_string(value[1:], **kwargs)
+        return eval(value) if value else False
+
+    if isinstance(value, list):
+        for i in range(len(value)):
+            value[i] = _evaluate(value[i], **kwargs)
+    elif isinstance(value, dict):
+        return {_evaluate(k, **kwargs): _evaluate(v, **kwargs) for k, v in value.items()}
+    else:
+        return _evaluate(value, **kwargs)
 
 
 def for_each(data: dict, search: list[str], depth: Optional[int] = 0, *,
@@ -606,20 +690,20 @@ def for_each(data: dict, search: list[str], depth: Optional[int] = 0, *,
             for index in indexes:
                 if index <= 0 or len(data) < index:
                     if debug:
-                        print("  " * depth + f"|_ {index}. element not found")
+                        logger.debug("  " * depth + f"|_ {index}. element not found")
                     yield None
                 if debug:
-                    print("  " * depth + f"|_ Selecting {index}. element")
+                    logger.debug("  " * depth + f"|_ Selecting {index}. element")
                 yield from for_each(data[index - 1], search, depth + 1, debug=debug)
         elif isinstance(data, dict):
             indexes = [x.strip() for x in _next[1:-1].split(',')]
             for index in indexes:
                 if index not in data:
                     if debug:
-                        print("  " * depth + f"|_ {index}. element not found")
+                        logger.debug("  " * depth + f"|_ {index}. element not found")
                     yield None
                 if debug:
-                    print("  " * depth + f"|_ Selecting element {index}")
+                    logger.debug("  " * depth + f"|_ Selecting element {index}")
                 yield from for_each(data[index], search, depth + 1, debug=debug)
 
     def process_pattern(_next, data, search, depth, debug, **kwargs):
@@ -627,37 +711,37 @@ def for_each(data: dict, search: list[str], depth: Optional[int] = 0, *,
             for idx, value in enumerate(data):
                 if evaluate(_next, **(kwargs | value)):
                     if debug:
-                        print("  " * depth + f"  - Element {idx + 1} matches.")
+                        logger.debug("  " * depth + f"  - Element {idx + 1} matches.")
                     yield from for_each(value, search, depth + 1, debug=debug)
         else:
             if evaluate(_next, **(kwargs | data)):
                 if debug:
-                    print("  " * depth + "  - Element matches.")
+                    logger.debug("  " * depth + "  - Element matches.")
                 yield from for_each(data, search, depth + 1, debug=debug)
 
     if not data or len(search) == depth:
         if debug:
-            print("  " * depth + ("|_ RESULT found => Processing ..." if data else "|_ NO result found, skipping."))
-        yield data
+            logger.debug("  " * depth + ("|_ RESULT found => Processing ..." if len(search) == depth else "|_ NO result found, skipping."))
+        yield data if len(search) == depth else None
     else:
         _next = search[depth]
         if _next == '*':
             if debug:
-                print("  " * depth + f"|_ Iterating over {len(data)} {search[depth - 1]} elements")
+                logger.debug("  " * depth + f"|_ Iterating over {len(data)} {search[depth - 1]} elements")
             yield from process_iteration(_next, data, search, depth, debug)
         elif _next.startswith('['):
             yield from process_indexing(_next, data, search, depth, debug)
         elif _next.startswith('$'):
             if debug:
-                print("  " * depth + f"|_ Searching pattern {_next} on {len(data)} {search[depth - 1]} elements")
+                logger.debug("  " * depth + f"|_ Searching pattern {_next} on {len(data)} {search[depth - 1]} elements")
             yield from process_pattern(_next, data, search, depth, debug, **kwargs)
         elif _next in data:
             if debug:
-                print("  " * depth + f"|_ {_next} found.")
+                logger.debug("  " * depth + f"|_ {_next} found.")
             yield from for_each(data.get(_next), search, depth + 1, debug=debug)
         else:
             if debug:
-                print("  " * depth + f"|_ {_next} not found.")
+                logger.debug("  " * depth + f"|_ {_next} not found.")
             yield None
 
 
@@ -669,5 +753,5 @@ class YAMLError(Exception):
     **Methods:**
 
     """
-    def __init__(self, file: str, ex: Union[ParserError, ScannerError]):
+    def __init__(self, file: str, ex: Union[MarkedYAMLError, ValueError, SchemaError]):
         super().__init__(f"Error in {file}, " + ex.__str__().replace('"<unicode string>"', file))

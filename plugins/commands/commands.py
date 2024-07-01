@@ -1,10 +1,10 @@
-import asyncio.subprocess
-import traceback
-
+import asyncio
 import discord
 import os
 import re
 import shlex
+import subprocess
+import traceback
 
 from core import Plugin, TEventListener, utils, Server, Status, Report, DEFAULT_TAG
 from discord.ext import commands
@@ -32,38 +32,45 @@ class Commands(Plugin):
             cwd = os.path.expandvars(config['cwd'])
         else:
             cwd = None
-        if 'shell' in config:
+        if config.get('shell', False):
             try:
-                p = await asyncio.subprocess.create_subprocess_shell(*cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE)
-                stdout, _ = p.communicate()
+                def run_cmd():
+                    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+                    return result.stdout, result.stderr
+
+                stdout, stderr = await asyncio.to_thread(run_cmd)
             except Exception as ex:
                 traceback.print_exc()
                 await ctx.send(ex.__str__())
                 return
-            output = p.stdout.decode('cp1252', 'ignore')
-            if not output:
+            if not stdout:
                 await ctx.send('Done')
                 return
-            tmp = '```'
-            for line in output.splitlines():
-                if len(tmp) + len(line) > 1997:
-                    tmp += '```'
-                    await ctx.send(tmp)
-                    tmp = '```'
+            lines = stdout.splitlines()
+            messages = []
+            current_message = '```'
+            for line in lines:
+                appended = current_message + line + '\n'
+                if len(appended) > 1994:
+                    current_message += '```'
+                    messages.append(current_message)
+                    current_message = '```' + line + '\n'
                 else:
-                    tmp += line + '\n'
-            if len(tmp) > 3:
-                tmp += '```'
-                await ctx.send(tmp)
+                    current_message = appended
+            current_message += '```'
+            messages.append(current_message)
+            for message in messages:
+                await ctx.send(message)
         else:
-            await asyncio.subprocess.create_subprocess_exec(*cmd, cwd=cwd,
-                                                            stdin=asyncio.subprocess.DEVNULL,
-                                                            stdout=asyncio.subprocess.DEVNULL)
+            def run_cmd():
+                subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+
+            await asyncio.to_thread(run_cmd)
             await ctx.send('Done.')
 
     async def event(self, ctx: commands.Context, config: dict, **kwargs) -> list[dict]:
         async def do_send(server: Server):
-            if 'sync' in config:
+            if config.get('sync', False):
                 if server.status != Status.SHUTDOWN:
                     return await server.send_to_dcs_sync(config)
                 else:
@@ -71,7 +78,7 @@ class Commands(Plugin):
                     return None
             else:
                 if server.status != Status.SHUTDOWN:
-                    server.send_to_dcs(config)
+                    await server.send_to_dcs(config)
                     await ctx.send(f'Event sent to {server.name}.')
                 else:
                     await ctx.send(f'Server {server.name} is {server.status.name}.')

@@ -9,8 +9,9 @@ import psycopg
 import shutil
 import ssl
 
-from contextlib import closing, suppress
-from core import Plugin, utils, TEventListener, PaginationReport, Group, DEFAULT_TAG, PluginConfigurationError
+from contextlib import suppress
+from core import Plugin, utils, TEventListener, PaginationReport, Group, DEFAULT_TAG, PluginConfigurationError, \
+    get_translation
 from discord import app_commands
 from discord.ext import commands, tasks
 from psycopg.rows import dict_row
@@ -20,8 +21,10 @@ from services import DCSServerBot
 from .listener import CloudListener
 from .logger import CloudLoggingHandler
 
+_ = get_translation(__name__.split('.')[1])
 
-class CloudHandler(Plugin):
+
+class Cloud(Plugin):
 
     def __init__(self, bot: DCSServerBot, eventlistener: Type[TEventListener] = None):
         super().__init__(bot, eventlistener)
@@ -67,21 +70,23 @@ class CloudHandler(Plugin):
         return self._session
 
     async def cog_load(self):
+        await super().cog_load()
         if self.config.get('upload_errors', True):
             cloud_logger = CloudLoggingHandler(node=self.node, url=self.base_url + '/errors/')
-            self.log.addHandler(cloud_logger)
+            self.log.root.addHandler(cloud_logger)
 
     async def cog_unload(self) -> None:
         if self.config.get('register', True):
             self.register.cancel()
         if self.config.get('upload_errors', True):
-            for handler in self.log.handlers:
+            for handler in self.log.root.handlers:
                 if isinstance(handler, CloudLoggingHandler):
                     self.log.removeHandler(handler)
         if 'token' in self.config:
             self.cloud_sync.cancel()
         if self.config.get('dcs-ban', False) or self.config.get('discord-ban', False):
             self.cloud_bans.cancel()
+        # noinspection PyAsyncCall
         asyncio.create_task(self.session.close())
         await super().cog_unload()
 
@@ -110,7 +115,7 @@ class CloudHandler(Plugin):
         else:
             await send(data)
 
-    async def update_ucid(self, conn: psycopg.Connection, old_ucid: str, new_ucid: str) -> None:
+    async def update_ucid(self, conn: psycopg.AsyncConnection, old_ucid: str, new_ucid: str) -> None:
         # we must not fail due to a cloud unavailability
         with suppress(Exception):
             await self.post('update_ucid', {"old_ucid": old_ucid, "new_ucid": new_ucid})
@@ -118,22 +123,31 @@ class CloudHandler(Plugin):
     # New command group "/cloud"
     cloud = Group(name="cloud", description="Commands to manage the DCSSB Cloud Service")
 
-    @cloud.command(description='Test the cloud-connection')
+    @cloud.command(description=_('Test the cloud-connection'))
     @app_commands.guild_only()
     @utils.app_has_role('Admin')
     async def status(self, interaction: discord.Interaction):
         ephemeral = utils.get_ephemeral(interaction)
-        await interaction.response.send_message(f'Checking cloud connection ...', ephemeral=ephemeral)
+        # noinspection PyUnresolvedReferences
+        await interaction.response.send_message(_('Checking cloud connection ...'), ephemeral=ephemeral)
         try:
-            await self.get('verify')
-            await interaction.followup.send(f'Cloud connection established.', ephemeral=ephemeral)
-            return
+            await self.get('discord-bans')
+            message = _('Cloud connection established.')
+            if 'token' in self.config:
+                try:
+                    await self.get('verify')
+                    message += _('\nCloud TOKEN configured and valid.')
+                except aiohttp.ClientError:
+                    message += _('\nCloud TOKEN configured, but invalid!')
+            else:
+                message += _("\nGet a cloud TOKEN, if you want to use cloud statistics!")
+            await interaction.followup.send(message, ephemeral=ephemeral)
         except aiohttp.ClientError:
-            await interaction.followup.send(f'Cloud not connected.', ephemeral=ephemeral)
+            await interaction.followup.send(_('Cloud not connected!'), ephemeral=ephemeral)
         finally:
             await interaction.delete_original_response()
 
-    @cloud.command(description='Resync statistics with the cloud')
+    @cloud.command(description=_('Resync statistics with the cloud'))
     @app_commands.guild_only()
     @utils.app_has_role('DCS Admin')
     @app_commands.rename(member="user")
@@ -142,10 +156,11 @@ class CloudHandler(Plugin):
                          Union[discord.Member, str], utils.UserTransformer]] = None):
         ephemeral = utils.get_ephemeral(interaction)
         if 'token' not in self.config:
-            await interaction.response.send_message('No cloud sync configured.', ephemeral=ephemeral)
+            # noinspection PyUnresolvedReferences
+            await interaction.response.send_message(_('No cloud sync configured!'), ephemeral=ephemeral)
             return
-        with self.pool.connection() as conn:
-            with conn.transaction():
+        async with self.apool.connection() as conn:
+            async with conn.transaction():
                 sql = 'UPDATE players SET synced = false'
                 if member:
                     if isinstance(member, str):
@@ -153,59 +168,64 @@ class CloudHandler(Plugin):
                     else:
                         sql += ' WHERE discord_id = %s'
                         member = member.id
-                    conn.execute(sql, (member, ))
+                    await conn.execute(sql, (member, ))
                 else:
-                    conn.execute(sql)
-                await interaction.response.send_message('Resync with cloud triggered.', ephemeral=ephemeral)
+                    await conn.execute(sql)
+        # noinspection PyUnresolvedReferences
+        await interaction.response.send_message(_('Resync with cloud triggered.'), ephemeral=ephemeral)
 
-    @cloud.command(description='Generate Cloud Statistics')
+    @cloud.command(description=_('Generate Cloud Statistics'))
     @app_commands.guild_only()
     @utils.app_has_role('DCS')
     async def statistics(self, interaction: discord.Interaction,
-                         user: Optional[app_commands.Transform[Union[discord.Member, str], utils.UserTransformer]],
-                         period: Optional[str]):
+                         user: Optional[app_commands.Transform[Union[discord.Member, str], utils.UserTransformer]]):
         if 'token' not in self.config:
-            await interaction.response.send_message('Cloud statistics are not activated in this Discord.',
+            # noinspection PyUnresolvedReferences
+            await interaction.response.send_message(_('Cloud statistics are not activated in this Discord!'),
                                                     ephemeral=True)
             return
         if not user:
             user = interaction.user
         if isinstance(user, discord.Member):
-            ucid = self.bot.get_ucid_by_member(user)
+            ucid = await self.bot.get_ucid_by_member(user)
             if not ucid:
-                await interaction.response.send_message(f"Use `/linkme` to link your account.", ephemeral=True)
+                # noinspection PyUnresolvedReferences
+                await interaction.response.send_message(_("Use {} to link your account.").format(
+                    (await utils.get_command(self.bot, name='linkme')).mention
+                ), ephemeral=True)
                 return
             name = user.display_name
         else:
             ucid = user
-            name = self.bot.get_member_or_name_by_ucid(ucid)
+            name = await self.bot.get_member_or_name_by_ucid(ucid)
             if isinstance(name, discord.Member):
                 name = name.display_name
+        # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         try:
             response = await self.get(f'stats/{ucid}')
             if not len(response):
-                await interaction.followup.send('No cloud-based statistics found for this user.', ephemeral=True)
+                await interaction.followup.send(_('No cloud-based statistics found for this user.'), ephemeral=True)
                 return
             # TODO: support period
             df = pd.DataFrame(response)
-            report = PaginationReport(self.bot, interaction, self.plugin_name, 'cloudstats.json')
+            report = PaginationReport(interaction, self.plugin_name, 'cloudstats.json')
             await report.render(user=name, data=df, guild=None)
         except aiohttp.ClientError:
-            await interaction.followup.send('Cloud not connected.', ephemeral=True)
+            await interaction.followup.send(_('Cloud not connected!'), ephemeral=True)
 
     @tasks.loop(minutes=15.0)
     async def cloud_bans(self):
         if self.config.get('dcs-ban', False):
-            self_bans: set = {x['ucid'] for x in self.bus.bans() if x['banned_by'] == self.plugin_name}
+            self_bans: set = {x['ucid'] for x in await self.bus.bans() if x['banned_by'] == self.plugin_name}
             external_bans: set = {ban['ucid'] for ban in await self.get('bans')}
             # find UCIDs to ban (in external_bans but not in self_bans)
             for ucid in external_bans - self_bans:
                 reason = next(ban['reason'] for ban in await self.get('bans') if ban['ucid'] == ucid)
-                self.bus.ban(ucid=ucid, reason='DGSA: ' + reason, banned_by=self.plugin_name)
+                await self.bus.ban(ucid=ucid, reason='DGSA: ' + reason, banned_by=self.plugin_name)
             # find UCIDs to unban (in self_bans but not in external_bans)
             for ucid in self_bans - external_bans:
-                self.bus.unban(ucid)
+                await self.bus.unban(ucid)
         if self.config.get('discord-ban', False):
             bans: dict = await self.get('discord-bans')
             users_to_ban = {await self.bot.fetch_user(x['discord_id']) for x in bans}
@@ -222,16 +242,20 @@ class CloudHandler(Plugin):
 
     @tasks.loop(seconds=10)
     async def cloud_sync(self):
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                with closing(conn.cursor(row_factory=dict_row)) as cursor:
-                    for row in cursor.execute("""
-                        SELECT ucid FROM players 
-                        WHERE synced IS FALSE 
-                        ORDER BY last_seen DESC 
-                        LIMIT 10
-                    """).fetchall():
-                        cursor.execute("""
+        async with self.apool.connection() as conn:
+            cursor = await conn.execute("""
+                SELECT ucid FROM players 
+                WHERE synced IS FALSE 
+                ORDER BY last_seen DESC 
+                LIMIT 10
+            """)
+            rows = await cursor.fetchall()
+        # We do not want to block the connection pool for an unnecessary amount of time
+        for row in rows:
+            async with self.apool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor(row_factory=dict_row) as cursor:
+                        await cursor.execute("""
                             SELECT s.player_ucid, m.mission_theatre, s.slot, 
                                    SUM(s.kills) as kills, SUM(s.pvp) as pvp, SUM(deaths) as deaths, 
                                    SUM(ejections) as ejections, SUM(crashes) as crashes, 
@@ -246,31 +270,32 @@ class CloudHandler(Plugin):
                             FROM statistics s, missions m 
                             WHERE s.player_ucid = %s AND s.hop_off IS NOT null AND s.mission_id = m.id 
                             GROUP BY 1, 2, 3
-                        """, (row['ucid'], ))
-                        for line in cursor:
+                        """, (row[0], ))
+                        async for line in cursor:
                             try:
                                 line['client'] = self.client
                                 await self.post('upload', line)
                             except TypeError as ex:
-                                self.log.warning(f"Could not replicate user {row['ucid']}: {ex}")
-                        cursor.execute('UPDATE players SET synced = TRUE WHERE ucid = %s', (row['ucid'], ))
+                                self.log.warning(f"Could not replicate user {row[0]}: {ex}")
+                        await cursor.execute('UPDATE players SET synced = TRUE WHERE ucid = %s', (row[0], ))
 
     @tasks.loop(hours=1)
     async def register(self):
-        with self.pool.connection() as conn:
-            with closing(conn.cursor()) as cursor:
-                cursor.execute("""
+        async with self.apool.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("""
                     SELECT count(distinct node) as num_bots, count(distinct instance) as num_servers 
                     FROM instances WHERE last_seen > (DATE(now() AT TIME ZONE 'utc') - interval '1 week')
                 """)
                 if cursor.rowcount == 0:
                     num_bots = num_servers = 0
                 else:
-                    row = cursor.fetchone()
+                    row = await cursor.fetchone()
                     num_bots = row[0]
                     num_servers = row[1]
         try:
             _, dcs_version = await self.node.get_dcs_branch_and_version()
+            # noinspection PyUnresolvedReferences
             bot = {
                 "guild_id": self.bot.guilds[0].id,
                 "bot_version": f"{self.bot.version}.{self.bot.sub_version}",
@@ -290,7 +315,7 @@ class CloudHandler(Plugin):
             await self.post('register', bot)
         except aiohttp.ClientError:
             self.log.debug('Cloud: Bot could not register due to service unavailability. Ignored.')
-        except Exception as error:
+        except Exception:
             self.log.debug("Error while registering: ", exc_info=True)
 
     @register.before_loop
@@ -299,4 +324,4 @@ class CloudHandler(Plugin):
 
 
 async def setup(bot: DCSServerBot):
-    await bot.add_cog(CloudHandler(bot, CloudListener))
+    await bot.add_cog(Cloud(bot, CloudListener))

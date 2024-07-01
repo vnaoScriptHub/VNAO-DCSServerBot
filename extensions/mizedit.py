@@ -3,12 +3,10 @@ import random
 from core import Extension, utils, Server, YAMLError, DEFAULT_TAG
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple
 
 # ruamel YAML support
 from ruamel.yaml import YAML
-from ruamel.yaml.parser import ParserError
-from ruamel.yaml.scanner import ScannerError
+from ruamel.yaml.error import MarkedYAMLError
 yaml = YAML()
 
 
@@ -24,11 +22,11 @@ class MizEdit(Extension):
             try:
                 self.presets |= yaml.load(Path(file).read_text(encoding='utf-8'))
                 if not isinstance(self.presets, dict):
-                    raise ParserError("File must contain a dictionary. not a list!")
+                    raise ValueError("File must contain a dictionary. not a list!")
             except FileNotFoundError:
                 self.log.error(f"MizEdit: File {file} not found!")
                 continue
-            except (ParserError, ScannerError) as ex:
+            except (MarkedYAMLError, ValueError) as ex:
                 raise YAMLError(file, ex)
 
     async def get_presets(self, config: dict) -> list[dict]:
@@ -50,7 +48,7 @@ class MizEdit(Extension):
             else:
                 # no preset found for the current time, so don't change anything
                 return []
-        if isinstance(presets, list):
+        elif isinstance(presets, list):
             presets = random.choice(presets)
         if isinstance(presets, str):
             all_presets = [x.strip() for x in presets.split(',')]
@@ -63,7 +61,7 @@ class MizEdit(Extension):
             if preset not in self.presets:
                 self.log.error(f'Preset {preset} not found, ignored.')
                 continue
-            self.log.info(f"  - Applying preset {preset}")
+            self.log.info(f"  - Applying preset {preset} ...")
             value = self.presets[preset]
             if isinstance(value, list):
                 for inner_preset in value:
@@ -76,7 +74,7 @@ class MizEdit(Extension):
                 modifications.append(value)
         return modifications
 
-    async def beforeMissionLoad(self, filename: str) -> Tuple[str, bool]:
+    async def beforeMissionLoad(self, filename: str) -> tuple[str, bool]:
         return await self.server.modifyMission(filename, await self.get_presets(self.config)), True
 
     def is_installed(self) -> bool:
@@ -85,5 +83,5 @@ class MizEdit(Extension):
     def is_running(self) -> bool:
         return True
 
-    async def shutdown(self) -> bool:
+    def shutdown(self) -> bool:
         return True

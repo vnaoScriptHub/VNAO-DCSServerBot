@@ -12,7 +12,7 @@ from extensions import TACVIEW_DEFAULT_DIR
 from pathlib import Path
 from typing import Union
 from rich import print
-from rich.prompt import IntPrompt, Prompt
+from rich.prompt import IntPrompt, Confirm
 
 # ruamel YAML support
 from ruamel.yaml import YAML
@@ -145,12 +145,12 @@ def migrate(node: str):
     else:
         guild_id = IntPrompt.ask(
             'Please enter your Discord Guild ID (right click on your Discord server, "Copy Server ID")')
-        yn = Prompt.ask(f"[red]ATTENTION:[/] Your database will be migrated to version 3.0. Do you want to continue?",
-                        choices=['y', 'n'], default='n')
-        if yn.lower() != 'y':
+        if not Confirm.ask(
+                "[red]ATTENTION:[/] Your database will be migrated to version 3.0. Do you want to continue?",
+                default=False):
             exit(-2)
-        single_admin = Prompt.ask(f"Do you want a central admin channel for your servers (Y) or keep separate ones (N)?",
-                                  choices=['y', 'n'], default='n') == 'y'
+        single_admin = Confirm.ask(
+            "Do you want a central admin channel for your servers (Y) or keep separate ones (N)?", default=False)
     print("Now, lean back and enjoy the migration...\n")
 
     try:
@@ -171,7 +171,7 @@ def migrate(node: str):
                 core.Plugin.migrate_to_3(node, plugin_name)
                 if plugin_name == 'admin':
                     post_migrate_admin(node)
-                    print(f"- Migrated config/admin.json to config/plugins/admin.yaml")
+                    print("- Migrated config/admin.json to config/plugins/admin.yaml")
                     continue
                 elif plugin_name == 'music':
                     post_migrate_music(node)
@@ -187,7 +187,7 @@ def migrate(node: str):
                     }
                     with open('config/plugins/commands.yaml', mode='w', encoding='utf-8') as out:
                         yaml.dump(data, out)
-                    print(f"- Migrated config/commands.json to config/plugins/commands.yaml")
+                    print("- Migrated config/commands.json to config/plugins/commands.yaml")
                 else:
                     print(f"- Migrated config/{plugin_name}.json to config/plugins/{plugin_name}.yaml")
 
@@ -274,10 +274,6 @@ def migrate(node: str):
 
             if 'GREETING_DM' in cfg['BOT']:
                 bot['greeting_dm'] = cfg['BOT']['GREETING_DM']
-            if 'CJK_FONT' in cfg['REPORTS']:
-                bot['reports'] = {
-                    'cjk_font': cfg['REPORTS']['CJK_FONT']
-                }
             if 'DISCORD_STATUS' in cfg['BOT']:
                 bot['discord_status'] = cfg['BOT']['DISCORD_STATUS']
             if 'AUDIT_CHANNEL' in cfg['BOT']:
@@ -300,8 +296,8 @@ def migrate(node: str):
             "desanitize": cfg['BOT'].getboolean('DESANITIZE')
         }
         if 'DCS_USER' in cfg['DCS']:
-            nodes[node]['DCS']['dcs_user'] = cfg['DCS']['DCS_USER']
-            nodes[node]['DCS']['dcs_password'] = cfg['DCS']['DCS_PASSWORD']
+            nodes[node]['DCS']['user'] = cfg['DCS']['DCS_USER']
+            nodes[node]['DCS']['password'] = cfg['DCS']['DCS_PASSWORD']
         nodes[node]['database'] = {
             "url": cfg['BOT']['DATABASE_URL'],
             "pool_min": int(cfg['DB']['MASTER_POOL_MIN']),
@@ -476,7 +472,8 @@ def migrate(node: str):
             print("- Created / updated config/plugins/missionstats.yaml")
         # shutil.move('config/default.ini', BACKUP_FOLDER)
         shutil.move('config/dcsserverbot.ini', BACKUP_FOLDER.format(node))
-        Prompt.ask("\n[green]Migration to DCSServerBot 3.0 successful![/]\n\nPress any key to launch.\n")
+        print("\n[green]Migration to DCSServerBot 3.0 successful![/]\n\n")
+        input("Press any key to launch.\n")
     except Exception:
         print("\n[red]Migration to DCSServerBot 3.0 failed![/]\n")
         traceback.print_exc()

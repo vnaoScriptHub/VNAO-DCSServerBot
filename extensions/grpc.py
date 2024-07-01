@@ -1,4 +1,3 @@
-import luadata
 import os
 import re
 
@@ -24,6 +23,8 @@ class gRPC(Extension):
             return value[1:-1].split(',')
         elif value.startswith('"'):
             return value.strip('"')
+        elif value.startswith("'"):
+            return value.strip("'")
         elif value == 'true':
             return True
         elif value == 'false':
@@ -82,6 +83,10 @@ class gRPC(Extension):
         if len(config):
             self.locals = self.locals | config
             self.locals['autostart'] = True
+            extension = self.server.extensions.get('SRS')
+            if extension:
+                srs_port = extension.config.get('port', extension.locals['Server Settings']['SERVER_PORT'])
+                self.locals['srs.addr'] = f"127.0.0.1:{srs_port}"
             path = os.path.join(self.server.instance.home, 'Config', 'dcs-grpc.lua')
             with open(path, mode='w', encoding='utf-8') as outfile:
                 for key, value in self.locals.items():
@@ -98,6 +103,6 @@ class gRPC(Extension):
         if not self.config.get('enabled', True):
             return False
         if not os.path.exists(os.path.join(self.home, 'dcs_grpc.dll')):
-            self.log.error(f"  => {self.server.name}: Can't load extension, DCS-gRPC not correctly installed.")
+            self.log.error(f"  => {self.server.name}: Can't load extension, {self.name} not correctly installed.")
             return False
         return True

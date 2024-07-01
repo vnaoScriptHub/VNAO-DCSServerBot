@@ -10,6 +10,7 @@ local require		= base.require
 local string 		= base.string
 local table         = base.table
 local tonumber		= base.tonumber
+local tostring		= base.tostring
 local DCS			= base.DCS
 local type			= base.type
 local os            = base.os
@@ -170,8 +171,10 @@ function loadScript(scriptPath)
 end
 
 function getIP(s)
-    for ip in string.gmatch(s, "(%d+.%d+.%d+.%d+)") do
-        return ip
-    end
+	if s ~= nil then
+		for ip in string.gmatch(s, "(%d+.%d+.%d+.%d+)") do
+			return ip
+		end
+	end
     return nil
 end

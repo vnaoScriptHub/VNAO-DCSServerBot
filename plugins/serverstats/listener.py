@@ -1,6 +1,8 @@
+import asyncio
 import math
 
 from core import EventListener, Plugin, event, Server, utils, ServiceRegistry
+from services import BotService
 
 
 class ServerStatsListener(EventListener):
@@ -25,9 +27,12 @@ class ServerStatsListener(EventListener):
                                               "{period} minutes!"),
                         server=server, fps=round(fps, 2), min_fps=min_fps, period=period)
                     if config.get("mentioning", True):
-                        await ServiceRegistry.get("Bot").alert(message, server)
+                        # noinspection PyAsyncCall
+                        asyncio.create_task(ServiceRegistry.get(BotService).alert(title="Server Performance Low!",
+                                                                                  message=message, server=server))
                     else:
-                        await self.bot.get_admin_channel(server).send(message)
+                        # noinspection PyAsyncCall
+                        asyncio.create_task(self.bot.get_admin_channel(server).send(message))
                     self.minutes[server.name] = 0
             else:
                 self.minutes[server.name] = 0
@@ -47,9 +52,9 @@ class ServerStatsListener(EventListener):
         with self.pool.connection() as conn:
             with conn.transaction():
                 conn.execute("""
-                INSERT INTO serverstats (server_name, node, mission_id, users, status, cpu, mem_total, 
-                                         mem_ram, read_bytes, write_bytes, bytes_sent, bytes_recv, fps, ping) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (server.name, server.node.name, server.mission_id, len(server.get_active_players()),
-                  server.status.name, cpu, data['mem_total'], data['mem_ram'], data['read_bytes'],
-                  data['write_bytes'], data['bytes_sent'], data['bytes_recv'], fps, ping))
+                    INSERT INTO serverstats (server_name, node, mission_id, users, status, cpu, mem_total, 
+                                             mem_ram, read_bytes, write_bytes, bytes_sent, bytes_recv, fps, ping) 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (server.name, server.node.name, server.mission_id, len(server.get_active_players()),
+                      server.status.name, cpu, data['mem_total'], data['mem_ram'], data['read_bytes'],
+                      data['write_bytes'], data['bytes_sent'], data['bytes_recv'], fps, ping))

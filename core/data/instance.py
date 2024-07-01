@@ -20,7 +20,6 @@ class InstanceBusyError(Exception):
 
 @dataclass
 class Instance(DataObject):
-    name: str
     locals: dict = field(repr=False, default_factory=dict)
     _server: Optional[Server] = field(compare=False, repr=False, default=None, init=False)
     missions_dir: str = field(repr=False, init=False, default=None)
@@ -30,9 +29,16 @@ class Instance(DataObject):
         raise NotImplementedError()
 
     @property
+    def dcs_host(self) -> str:
+        if self.server:
+            return self.server.settings.get('bind_address') or '127.0.0.1'
+        else:
+            return "127.0.0.1"
+
+    @property
     def dcs_port(self) -> int:
         if self.server:
-            return int(self.server.settings['port'])
+            return int(self.server.settings.get('port', 10308))
         else:
             return int(self.locals.get('dcs_port', 10308))
 
@@ -46,7 +52,7 @@ class Instance(DataObject):
 
     @property
     def extensions(self) -> dict:
-        return self.locals.get('extensions', {})
+        return self.locals.get('extensions') or {}
 
     @property
     def configured_server(self) -> Optional[str]:

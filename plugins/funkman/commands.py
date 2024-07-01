@@ -36,11 +36,11 @@ class FunkMan(Plugin):
                 ini = ConfigParser()
                 ini.read(os.path.join(config['install'], 'FunkMan.ini'))
                 if 'CHANNELID_MAIN' in ini['FUNKBOT']:
-                    config['CHANNELID_MAIN'] = ini['FUNKBOT']['CHANNELID_MAIN']
+                    config['CHANNELID_MAIN'] = int(ini['FUNKBOT']['CHANNELID_MAIN'])
                 if 'CHANNELID_RANGE' in ini['FUNKBOT']:
-                    config['CHANNELID_RANGE'] = ini['FUNKBOT']['CHANNELID_RANGE']
+                    config['CHANNELID_RANGE'] = int(ini['FUNKBOT']['CHANNELID_RANGE'])
                 if 'CHANNELID_AIRBOSS' in ini['FUNKBOT']:
-                    config['CHANNELID_AIRBOSS'] = ini['FUNKBOT']['CHANNELID_AIRBOSS']
+                    config['CHANNELID_AIRBOSS'] = int(ini['FUNKBOT']['CHANNELID_AIRBOSS'])
                 if 'IMAGEPATH' in ini['FUNKPLOT']:
                     if ini['FUNKPLOT']['IMAGEPATH'].startswith('.'):
                         config['IMAGEPATH'] = config['install'] + ini['FUNKPLOT']['IMAGEPATH'][1:]
@@ -64,24 +64,24 @@ class FunkMan(Plugin):
         if server.instance.name not in self._config[server.node.name] or not use_cache:
             default, specific = self.get_base_config(server)
             for x in ['strafe_board', 'strafe_channel', 'bomb_board', 'bomb_channel']:
-                if x in default:
-                    del default[x]
+                default.pop(x, None)
             self._config[server.node.name][server.instance.name] = default | specific
         return self._config[server.node.name][server.instance.name]
 
-    async def prune(self, conn: psycopg.Connection, *, days: int = -1, ucids: list[str] = None):
+    async def prune(self, conn: psycopg.AsyncConnection, *, days: int = -1, ucids: list[str] = None,
+                    server: Optional[str] = None) -> None:
         self.log.debug('Pruning FunkMan ...')
         if ucids:
             for ucid in ucids:
-                conn.execute('DELETE FROM bomb_runs WHERE player_ucid = %s', (ucid,))
-                conn.execute('DELETE FROM strafe_runs WHERE player_ucid = %s', (ucid,))
+                await conn.execute('DELETE FROM bomb_runs WHERE player_ucid = %s', (ucid,))
+                await conn.execute('DELETE FROM strafe_runs WHERE player_ucid = %s', (ucid,))
         elif days > -1:
-            conn.execute(f"""
-                DELETE FROM bomb_runs WHERE time < (DATE(now() AT TIME ZONE 'utc') - interval '{days} days')
-            """)
-            conn.execute(f"""
-                DELETE FROM strafe_runs WHERE time < (DATE(now() AT TIME ZONE 'utc') - interval '{days} days')
-            """)
+            await conn.execute(f"""
+                DELETE FROM bomb_runs WHERE time < (DATE(now() AT TIME ZONE 'utc') - %s::interval)
+            """, (f'{days} days', ))
+            await conn.execute("""
+                DELETE FROM strafe_runs WHERE time < (DATE(now() AT TIME ZONE 'utc') - %s::interval)
+            """, (f'{days} days', ))
         self.log.debug('FunkMan pruned.')
 
 

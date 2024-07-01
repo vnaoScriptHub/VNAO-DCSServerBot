@@ -1,9 +1,8 @@
 import asyncio
-from contextlib import closing
-from core import utils
+from core import utils, Status
 from core.report.errors import ValueNotInRange
 from psycopg.rows import dict_row
-from typing import Any, Tuple
+from typing import Any
 
 __all__ = [
     "parse_params",
@@ -11,7 +10,7 @@ __all__ = [
 ]
 
 
-def parse_params(kwargs: dict, params: Tuple[dict, list]):
+def parse_params(kwargs: dict, params: tuple[dict, list]):
     new_args = kwargs.copy()
     if isinstance(params, dict):
         for key, value in params.items():
@@ -39,13 +38,16 @@ async def parse_input(self, kwargs: dict, params: list[Any]):
             elif 'default' in param:
                 new_args[param['name']] = param['default']
         elif 'sql' in param:
-            with self.pool.connection() as conn:
-                with closing(conn.cursor(row_factory=dict_row)) as cursor:
-                    cursor.execute(utils.format_string(param['sql'], **kwargs), kwargs)
+            async with self.apool.connection() as conn:
+                async with conn.cursor(row_factory=dict_row) as cursor:
+                    await cursor.execute(utils.format_string(param['sql'], **kwargs), kwargs)
                     if cursor.rowcount == 1:
-                        for name, value in cursor.fetchone().items():
+                        for name, value in (await cursor.fetchone()).items():
                             new_args[name] = value
         elif 'callback' in param:
+            server = kwargs['server']
+            if server.status not in [Status.PAUSED, Status.RUNNING]:
+                new_args[param['callback']] = None
             try:
                 data: dict = await kwargs['server'].send_to_dcs_sync({
                     "command": "getVariable", "name": param['callback']
@@ -54,4 +56,19 @@ async def parse_input(self, kwargs: dict, params: list[Any]):
                     new_args[param['callback']] = data['value']
             except (TimeoutError, asyncio.TimeoutError):
                 new_args[param['callback']] = None
+        elif 'event' in param:
+            server = kwargs['server']
+            if server.status not in [Status.PAUSED, Status.RUNNING]:
+                new_args[param['event']] = None
+            try:
+                cmd = {
+                    "command": param['event']
+                }
+                if 'params' in param:
+                    cmd |= param['params']
+                data: dict = await kwargs['server'].send_to_dcs_sync(cmd)
+                if data:
+                    new_args[param['event']] = data
+            except (TimeoutError, asyncio.TimeoutError):
+                new_args[param['event']] = None
     return new_args

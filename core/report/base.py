@@ -4,7 +4,9 @@ import asyncio
 import discord
 import inspect
 import json
+import logging
 import os
+import psycopg
 import sys
 
 from abc import ABC, abstractmethod
@@ -12,7 +14,7 @@ from core import utils, Channel
 from discord import Interaction, SelectOption
 from discord.ui import View, Button, Select, Item
 from discord.utils import MISSING
-from typing import Tuple, Optional, TYPE_CHECKING, Any, cast, Union
+from typing import Optional, TYPE_CHECKING, Any, cast, Union
 
 from .elements import ReportElement
 from .env import ReportEnv
@@ -36,7 +38,7 @@ class Report:
     def __init__(self, bot: DCSServerBot, plugin: str, filename: str):
         self.bot = bot
         self.log = bot.log
-        self.pool = bot.pool
+        self.apool = bot.apool
         self.env = ReportEnv(bot)
         default = f'./plugins/{plugin}/reports/{filename}'
         overwrite = f'./reports/{plugin}/{filename}'
@@ -68,9 +70,9 @@ class Report:
             elif name == 'description':
                 self.env.embed.description = utils.format_string(item, **self.env.params)[:4096]
             elif name == 'url':
-                self.env.embed.url = item
+                self.env.embed.url = utils.format_string(item, **self.env.params)
             elif name == 'img':
-                self.env.embed.set_thumbnail(url=item)
+                self.env.embed.set_thumbnail(url=utils.format_string(item, **self.env.params))
             elif name == 'footer':
                 footer = self.env.embed.footer.text or ''
                 text = utils.format_string(item, **self.env.params)
@@ -108,8 +110,12 @@ class Report:
                             except (TimeoutError, asyncio.TimeoutError):
                                 self.log.error(f"Timeout while processing report {self.filename}! "
                                                f"Some elements might be empty.")
-                            except Exception as ex:
-                                self.log.exception(ex)
+                            except psycopg.OperationalError:
+                                self.log.error(f"Database error while processing report {self.filename}! "
+                                               f"Some elements might be empty.")
+                            except Exception:
+                                self.log.error(f"Error while processing report {self.filename}! "
+                                               f"Some elements might be empty.", exc_info=True)
                         else:
                             raise UnknownReportElement(element['class'])
                     else:
@@ -122,7 +128,7 @@ class Pagination(ABC):
         self.env = env
 
     @abstractmethod
-    def values(self, **kwargs) -> list[Any]:
+    async def values(self, **kwargs) -> list[Any]:
         ...
 
 
@@ -131,21 +137,21 @@ class PaginationReport(Report):
     class NoPaginationInformation(Exception):
         ...
 
-    def __init__(self, bot: DCSServerBot, interaction: discord.Interaction, plugin: str, filename: str,
+    def __init__(self, interaction: discord.Interaction, plugin: str, filename: str,
                  pagination: Optional[list] = None, keep_image: bool = False):
-        super().__init__(bot, plugin, filename)
+        super().__init__(interaction.client, plugin, filename)
         self.interaction = interaction
         self.pagination = pagination
         self.keep_image = keep_image
         if 'pagination' not in self.report_def:
             raise PaginationReport.NoPaginationInformation
 
-    def read_param(self, param: dict, **kwargs) -> Tuple[str, list]:
+    async def read_param(self, param: dict, **kwargs) -> tuple[str, list]:
         name = param['name']
         values = None
         if 'sql' in param:
-            with self.pool.connection() as conn:
-                values = [x[0] for x in conn.execute(param['sql'], kwargs)]
+            async with self.apool.connection() as conn:
+                values = [x[0] async for x in await conn.execute(param['sql'], kwargs)]
         elif 'values' in param:
             values = param['values']
         elif 'obj' in param:
@@ -155,7 +161,7 @@ class PaginationReport(Report):
             elif isinstance(obj, dict):
                 values = obj.keys()
         elif 'class' in param:
-            values = cast(Pagination, utils.str_to_class(param['class'])(self.env)).values(**kwargs)
+            values = await cast(Pagination, utils.str_to_class(param['class'])(self.env)).values(**kwargs)
         elif self.pagination:
             values = self.pagination
         return name, values
@@ -163,6 +169,7 @@ class PaginationReport(Report):
     class PaginationReportView(View):
         def __init__(self, name, values, index, func, keep_image: bool, *args, **kwargs):
             super().__init__()
+            self.log = logging.getLogger(__name__)
             self.name = name
             self.values = values
             self.index = index
@@ -183,35 +190,35 @@ class PaginationReport(Report):
                                                default=(x is None)
                                                ) for idx, x in enumerate(self.values) if idx < 25]
             if self.index == 0:
-                self.children[1].disabled = True
-                self.children[2].disabled = True
-            if self.index == len(values) - 1:
-                self.children[3].disabled = True
-                self.children[4].disabled = True
+                target_children = self.children[1:3]
+                new_states = [True, True]
+            elif self.index == len(values) - 1:
+                target_children = self.children[3:5]
+                new_states = [True, True]
+            else:
+                target_children = []
+                new_states = []
+            for child, new_state in zip(target_children, new_states):
+                child.disabled = new_state
 
         async def render(self, value) -> ReportEnv:
             self.kwargs[self.name] = value if value != 'All' else None
             return await self.func(*self.args, **self.kwargs)
 
         async def paginate(self, value, interaction: discord.Interaction):
+            # noinspection PyUnresolvedReferences
             await interaction.response.defer()
             env = await self.render(value)
             try:
+                target_children = self.children[1:5]
                 if self.index == 0:
-                    self.children[1].disabled = True
-                    self.children[2].disabled = True
-                    self.children[3].disabled = False
-                    self.children[4].disabled = False
+                    new_states = [True, True, False, False]
                 elif self.index == len(self.values) - 1:
-                    self.children[1].disabled = False
-                    self.children[2].disabled = False
-                    self.children[3].disabled = True
-                    self.children[4].disabled = True
+                    new_states = [False, False, True, True]
                 else:
-                    self.children[1].disabled = False
-                    self.children[2].disabled = False
-                    self.children[3].disabled = False
-                    self.children[4].disabled = False
+                    new_states = [False, False, False, False]
+                for child, state in zip(target_children, new_states):
+                    child.disabled = state
                 if env.filename:
                     await interaction.edit_original_response(embed=env.embed, view=self, attachments=[
                             discord.File(fp=env.buffer or env.filename, filename=os.path.basename(env.filename))
@@ -231,38 +238,42 @@ class PaginationReport(Report):
             await self.paginate(self.values[self.index], interaction)
 
         @discord.ui.button(label="<<", style=discord.ButtonStyle.secondary)
-        async def on_start(self, interaction: Interaction, button: Button):
+        async def on_start(self, interaction: Interaction, _: Button):
             self.index = 0
             await self.paginate(self.values[self.index], interaction)
 
         @discord.ui.button(label="Back", style=discord.ButtonStyle.primary)
-        async def on_left(self, interaction: Interaction, button: Button):
+        async def on_left(self, interaction: Interaction, _: Button):
             self.index -= 1
             await self.paginate(self.values[self.index], interaction)
 
         @discord.ui.button(label="Next", style=discord.ButtonStyle.primary)
-        async def on_right(self, interaction: Interaction, button: Button):
+        async def on_right(self, interaction: Interaction, _: Button):
             self.index += 1
             await self.paginate(self.values[self.index], interaction)
 
         @discord.ui.button(label=">>", style=discord.ButtonStyle.secondary)
-        async def on_end(self, interaction: Interaction, button: Button):
+        async def on_end(self, interaction: Interaction, _: Button):
             self.index = len(self.values) - 1
             await self.paginate(self.values[self.index], interaction)
 
         @discord.ui.button(label="Quit", style=discord.ButtonStyle.red)
-        async def on_cancel(self, interaction: Interaction, button: Button):
+        async def on_cancel(self, interaction: Interaction, _: Button):
+            self.index = -1
+            # noinspection PyUnresolvedReferences
             await interaction.response.defer()
             self.stop()
 
         async def on_error(self, interaction: Interaction, error: Exception, item: Item[Any], /) -> None:
-            print(error)
+            self.log.exception(error)
             self.stop()
 
     async def render(self, *args, **kwargs) -> ReportEnv:
+        # noinspection PyUnresolvedReferences
         if not self.interaction.response.is_done():
+            # noinspection PyUnresolvedReferences
             await self.interaction.response.defer()
-        name, values = self.read_param(self.report_def['pagination']['param'], **kwargs)
+        name, values = await self.read_param(self.report_def['pagination']['param'], **kwargs)
         start_index = 0
         if 'start_index' in kwargs:
             start_index = kwargs['start_index']
@@ -288,7 +299,8 @@ class PaginationReport(Report):
                 message = await self.interaction.followup.send(
                     embed=env.embed,
                     view=view or MISSING,
-                    file=discord.File(fp=env.buffer or env.filename, filename=os.path.basename(env.filename)) if env.filename else MISSING
+                    file=discord.File(fp=env.buffer or env.filename,
+                                      filename=os.path.basename(env.filename)) if env.filename else MISSING
                 )
             finally:
                 if not self.keep_image and env.filename:
@@ -299,12 +311,15 @@ class PaginationReport(Report):
                 await view.wait()
             else:
                 message = None
-        except Exception as ex:
-            self.log.exception(ex)
+        except Exception:
+            self.log.error(f"Exception while processing report {self.filename}!")
             raise
         finally:
-            if message:
-                await message.delete()
+            try:
+                if message:
+                    await message.delete()
+            except discord.NotFound:
+                pass
         return self.env
 
 
@@ -321,12 +336,14 @@ class PersistentReport(Report):
         env = None
         try:
             env = await super().render(*args, **kwargs)
-            file = discord.File(fp=env.buffer or env.filename, filename=os.path.basename(env.filename)) if env.filename else MISSING
+            file = discord.File(fp=env.buffer or env.filename,
+                                filename=os.path.basename(env.filename)) if env.filename else MISSING
             await self.bot.setEmbed(embed_name=self.embed_name, embed=env.embed, channel_id=self.channel_id,
                                     file=file, server=self.server)
             return env
-        except Exception as ex:
-            self.log.exception(ex)
+        except Exception:
+            self.log.error(f"Exception while processing report {self.filename}!")
+            raise
         finally:
             if env and env.filename:
                 env.buffer.close()

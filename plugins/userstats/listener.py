@@ -1,7 +1,8 @@
+import asyncio
 import psycopg
 
-from contextlib import closing
-from core import EventListener, Plugin, Status, Server, Side, Player, event, chat_command, DataObjectFactory
+from core import EventListener, Plugin, Status, Server, Side, Player, event, chat_command
+from psycopg import Connection
 from typing import Union
 
 
@@ -33,11 +34,11 @@ class UserStatisticsEventListener(EventListener):
     SQL_MISSION_HANDLING = {
         'start_mission': 'INSERT INTO missions (server_name, mission_name, mission_theatre) VALUES (%s, %s, %s)',
         'current_mission_id': 'SELECT id, mission_name FROM missions WHERE server_name = %s AND mission_end IS NULL',
-        'close_statistics': "UPDATE statistics SET hop_off = GREATEST(hop_on, (now() AT TIME ZONE 'utc')) WHERE mission_id = %s AND hop_off IS NULL",
+        'close_statistics': "UPDATE statistics SET hop_off = GREATEST((hop_on + INTERVAL '1 second'), (now() AT TIME ZONE 'utc')) WHERE mission_id = %s AND hop_off IS NULL",
         'close_mission': "UPDATE missions SET mission_end = (now() AT TIME ZONE 'utc') WHERE id = %s",
         'check_player': 'SELECT slot FROM statistics WHERE mission_id = %s AND player_ucid = %s AND hop_off IS NULL',
         'start_player': 'INSERT INTO statistics (mission_id, player_ucid, slot, side) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING',
-        'stop_player': "UPDATE statistics SET hop_off = GREATEST(hop_on, (now() AT TIME ZONE 'utc')) WHERE mission_id = %s AND player_ucid = %s AND hop_off IS NULL",
+        'stop_player': "UPDATE statistics SET hop_off = GREATEST((hop_on + INTERVAL '1 second'), (now() AT TIME ZONE 'utc')) WHERE mission_id = %s AND player_ucid = %s AND hop_off IS NULL",
         'all_players': 'SELECT player_ucid FROM statistics WHERE mission_id = %s AND hop_off IS NULL'
     }
 
@@ -47,7 +48,7 @@ class UserStatisticsEventListener(EventListener):
 
     async def processEvent(self, name: str, server: Server, data: dict) -> None:
         try:
-            if name == 'registerDCSServer' or server.name in self.statistics:
+            if name in ['registerDCSServer', 'onMemberLinked', 'onMemberUnlinked'] or server.name in self.statistics:
                 await super().processEvent(name, server, data)
         except Exception as ex:
             self.log.exception(ex)
@@ -61,8 +62,8 @@ class UserStatisticsEventListener(EventListener):
         return unit_type
 
     @staticmethod
-    def close_all_statistics(cursor: psycopg.Cursor, server: Server):
-        cursor.execute("""
+    def close_all_statistics(conn: psycopg.Connection, server: Server):
+        conn.execute("""
             UPDATE missions m1 SET mission_end = (
                 SELECT mission_start - INTERVAL '1 second' FROM missions m2 
                 WHERE m1.server_name = m2.server_name
@@ -70,22 +71,24 @@ class UserStatisticsEventListener(EventListener):
                 ORDER BY 1 LIMIT 1)
             WHERE m1.server_name = %s AND m1.mission_end IS NULL
         """, (server.name,))
-        cursor.execute("""
+        conn.execute("""
             UPDATE missions SET mission_end = (now() AT TIME ZONE 'utc') WHERE server_name = %s AND mission_end IS NULL
         """, (server.name,))
 
-        for row in cursor.execute("""
-            SELECT mission_id, player_ucid, slot 
-            FROM statistics 
-            WHERE mission_id IN (
-                SELECT id FROM missions WHERE server_name = %s
-            ) AND hop_off IS NULL
-        """, (server.name,)).fetchall():
-            cursor.execute("""
+        cursor = conn.execute("""
+                    SELECT mission_id, player_ucid, slot 
+                    FROM statistics 
+                    WHERE mission_id IN (
+                        SELECT id FROM missions WHERE server_name = %s
+                    ) AND hop_off IS NULL
+                """, (server.name,))
+        rows = cursor.fetchall()
+        for row in rows:
+            conn.execute("""
                 UPDATE statistics SET hop_off = (SELECT mission_end FROM missions WHERE id = %s)
                 WHERE mission_id = %s AND player_ucid = %s AND slot = %s AND hop_off IS NULL
             """, (row[0], row[0], row[1], row[2]))
-        cursor.execute("""
+        conn.execute("""
             UPDATE statistics SET hop_off = (now() AT TIME ZONE 'utc') WHERE mission_id IN (
                 SELECT id FROM missions WHERE server_name = %s
             ) AND hop_off IS NULL
@@ -102,7 +105,7 @@ class UserStatisticsEventListener(EventListener):
 
         with self.pool.connection() as conn:
             with conn.transaction():
-                with closing(conn.cursor()) as cursor:
+                with conn.cursor() as cursor:
                     mission_id = -1
                     cursor.execute(self.SQL_MISSION_HANDLING['current_mission_id'], (server.name,))
                     if cursor.rowcount == 1:
@@ -117,12 +120,11 @@ class UserStatisticsEventListener(EventListener):
                         if cursor.rowcount >= 1:
                             self.close_all_statistics(cursor, server)
                         # create a new mission
-                        cursor.execute(self.SQL_MISSION_HANDLING['start_mission'], (server.name,
-                                                                                    data['current_mission'],
-                                                                                    data['current_map']))
+                        cursor.execute(self.SQL_MISSION_HANDLING['start_mission'],
+                                       (server.name, data['current_mission'], data['current_map']))
                         cursor.execute(self.SQL_MISSION_HANDLING['current_mission_id'], (server.name,))
                         if cursor.rowcount == 1:
-                            mission_id = cursor.fetchone()[0]
+                            mission_id = (cursor.fetchone())[0]
                         else:
                             self.log.error('FATAL: Initialization of mission table failed. Statistics will not be '
                                            'gathered for this session.')
@@ -138,7 +140,7 @@ class UserStatisticsEventListener(EventListener):
                             player_started = False
                             if cursor.rowcount == 1:
                                 # the player is there already ...
-                                if cursor.fetchone()[0] != player.unit_type:
+                                if (cursor.fetchone())[0] != player.unit_type:
                                     # ... but with a different aircraft, so close the old session
                                     cursor.execute(self.SQL_MISSION_HANDLING['stop_player'],
                                                    (mission_id, player.ucid))
@@ -146,15 +148,8 @@ class UserStatisticsEventListener(EventListener):
                                     # session will be kept
                                     player_started = True
                             if not player_started and player.side != Side.SPECTATOR:
-                                # only warn for unknown users if it is a non-public server and automatch is on
-                                if not player.member and self.bot.locals.get('automatch', True) and \
-                                        len(server.settings['password']) > 0:
-                                    await self.bot.get_admin_channel(server).send(
-                                        f"Player {player.name} (ucid={player.ucid}) can't be matched to a "
-                                        f"discord user.")
                                 cursor.execute(self.SQL_MISSION_HANDLING['start_player'],
-                                               (mission_id, player.ucid, self.get_unit_type(player),
-                                                player.side.value))
+                                               (mission_id, player.ucid, self.get_unit_type(player), player.side.value))
                         # close dead entries in the database (if existent)
                         cursor.execute(self.SQL_MISSION_HANDLING['all_players'], (mission_id, ))
                         for row in cursor.fetchall():
@@ -165,18 +160,16 @@ class UserStatisticsEventListener(EventListener):
     async def onMissionLoadEnd(self, server: Server, data: dict) -> None:
         with self.pool.connection() as conn:
             with conn.transaction():
-                with closing(conn.cursor()) as cursor:
-                    self.close_all_statistics(cursor, server)
-                    cursor.execute(self.SQL_MISSION_HANDLING['start_mission'], (server.name,
-                                                                                data['current_mission'],
-                                                                                data['current_map']))
-                    cursor.execute(self.SQL_MISSION_HANDLING['current_mission_id'], (server.name,))
-                    if cursor.rowcount == 1:
-                        server.mission_id = cursor.fetchone()[0]
-                    else:
-                        server.mission_id = -1
-                        self.log.error('FATAL: Initialization of mission table failed. Statistics will not be '
-                                       'gathered for this session.')
+                self.close_all_statistics(conn, server)
+                conn.execute(self.SQL_MISSION_HANDLING['start_mission'],
+                             (server.name, data['current_mission'], data['current_map']))
+                cursor = conn.execute(self.SQL_MISSION_HANDLING['current_mission_id'], (server.name,))
+                if cursor.rowcount == 1:
+                    server.mission_id = (cursor.fetchone())[0]
+                else:
+                    server.mission_id = -1
+                    self.log.error('FATAL: Initialization of mission table failed. Statistics will not be '
+                                   'gathered for this session.')
 
     def close_mission_stats(self, server: Server):
         with self.pool.connection() as conn:
@@ -185,27 +178,8 @@ class UserStatisticsEventListener(EventListener):
                 conn.execute(self.SQL_MISSION_HANDLING['close_mission'], (server.mission_id,))
 
     @event(name="onSimulationStop")
-    async def onSimulationStop(self, server: Server, data: dict) -> None:
+    async def onSimulationStop(self, server: Server, _: dict) -> None:
         self.close_mission_stats(server)
-
-    @event(name="onPlayerStart")
-    async def onPlayerStart(self, server: Server, data: dict) -> None:
-        if data['id'] == 1 or 'ucid' not in data:
-            return
-        player: Player = server.get_player(id=data['id'])
-        if not player.member:
-            player.sendChatMessage(self.get_config(server).get(
-                'greeting_message_unmatched', '{player.name}, please use /linkme in our Discord, '
-                                              'if you want to see your user stats!').format(server=server,
-                                                                                            player=player))
-            # only warn for unknown users if it is a non-public server and automatch is on
-            if self.bot.locals.get('automatch', True) and server.settings['password']:
-                await self.bot.get_admin_channel(server).send(
-                    f'Player {player.display_name} (ucid={player.ucid}) can\'t be matched to a discord user.')
-        else:
-            player.sendChatMessage(self.get_config(server).get(
-                'greeting_message_members', '{player.name}, welcome back to {server.name}!').format(player=player,
-                                                                                                    server=server))
 
     @event(name="onPlayerChangeSlot")
     async def onPlayerChangeSlot(self, server: Server, data: dict) -> None:
@@ -219,151 +193,154 @@ class UserStatisticsEventListener(EventListener):
                                  (server.mission_id, data['ucid'], self.get_unit_type(data), data['side']))
 
     @event(name="disableUserStats")
-    async def disableUserStats(self, server: Server, data: dict) -> None:
+    async def disableUserStats(self, server: Server, _: dict) -> None:
         self.statistics.discard(server.name)
         self.close_mission_stats(server)
 
-    @event(name="onGameEvent")
-    async def onGameEvent(self, server: Server, data: dict) -> None:
-        # ignore game events until the server is not initialized correctly
-        # if server.status != Status.RUNNING:
-        #    return
-        if data['eventName'] == 'disconnect':
-            if data['arg1'] != 1:
+    def _handle_disconnect_event(self, conn: Connection, server: Server, data: dict) -> None:
+        if data['arg1'] != 1:
+            player: Player = server.get_player(id=data['arg1'])
+            if not player:
+                self.log.warning(f"Player id={data['arg1']} not found. Can't close their statistics.")
+                return
+            conn.execute(self.SQL_MISSION_HANDLING['stop_player'], (server.mission_id, player.ucid))
+
+    def _handle_kill_killer(self, conn: Connection, server: Server, data: dict) -> None:
+        if data['arg4'] != -1:
+            # selfkill
+            if data['arg1'] == data['arg4']:
+                kill_type = 'self_kill'
+            # teamkills
+            elif data['arg3'] == data['arg6']:
+                kill_type = 'teamkill'
+            # PVP
+            elif data['victimCategory'] == 'Planes':
+                kill_type = 'pvp_planes'
+            elif data['victimCategory'] == 'Helicopters':
+                kill_type = 'pvp_helicopters'
+        elif data['victimCategory'] == 'Planes':
+            kill_type = 'kill_planes'
+        elif data['victimCategory'] == 'Helicopters':
+            kill_type = 'kill_helicopters'
+        elif data['victimCategory'] == 'Ships':
+            kill_type = 'kill_ships'
+        elif data['victimCategory'] == 'Air Defence':
+            kill_type = 'kill_sams'
+        elif data['victimCategory'] in ['Unarmed', 'Armor', 'Infantry', 'Fortification', 'Artillery', 'MissilesSS']:
+            kill_type = 'kill_ground'
+        else:
+            kill_type = 'kill_other'  # Static objects
+        if kill_type in self.SQL_EVENT_UPDATES.keys():
+            pilot: Player = server.get_player(id=data['arg1'])
+            for crew_member in server.get_crew_members(pilot):
+                conn.execute(self.SQL_EVENT_UPDATES[kill_type], (server.mission_id, crew_member.ucid))
+
+    def _handle_kill_victim(self, conn: Connection, server: Server, data: dict) -> None:
+        if data['arg1'] != -1:
+            if data['arg1'] == data['arg4']:  # self kill
+                death_type = 'self_kill'
+            elif data['arg3'] == data['arg6']:  # killed by team member - no death counted
+                death_type = 'teamdeath'
+            # PVP
+            elif data['killerCategory'] == 'Planes':
+                death_type = 'deaths_pvp_planes'
+            elif data['killerCategory'] == 'Helicopters':
+                death_type = 'deaths_pvp_helicopters'
+        elif data['killerCategory'] == 'Planes':
+            death_type = 'deaths_planes'
+        elif data['killerCategory'] == 'Helicopters':
+            death_type = 'deaths_helicopters'
+        elif data['killerCategory'] == 'Ships':
+            death_type = 'deaths_ships'
+        elif data['killerCategory'] == 'Air Defence':
+            death_type = 'deaths_sams'
+        elif data['killerCategory'] in ['Armor', 'Infantry' 'Fortification', 'Artillery', 'MissilesSS']:
+            death_type = 'deaths_ground'
+        else:
+            death_type = 'other'
+        if death_type in self.SQL_EVENT_UPDATES.keys():
+            pilot: Player = server.get_player(id=data['arg4'])
+            for crew_member in server.get_crew_members(pilot):
+                conn.execute(self.SQL_EVENT_UPDATES[death_type], (server.mission_id, crew_member.ucid))
+
+    def _handle_kill_event(self, conn: Connection, server: Server, data: dict) -> None:
+        # Player is an AI => return
+        if data['arg1'] != -1:
+            self._handle_kill_killer(conn, server, data)
+        # Victim is an AI => return
+        if data['arg4'] != -1:
+            self._handle_kill_victim(conn, server, data)
+
+    def _handle_common_event(self, conn: Connection, server: Server, data: dict) -> None:
+        if data['arg1'] != -1:
+            if data['eventName'] in self.SQL_EVENT_UPDATES.keys():
                 player: Player = server.get_player(id=data['arg1'])
                 if not player:
-                    self.log.warning(f"Player id={data['arg1']} not found. Can't close their statistics.")
                     return
-                with self.pool.connection() as conn:
-                    with conn.transaction():
-                        conn.execute(self.SQL_MISSION_HANDLING['stop_player'], (server.mission_id, player.ucid))
-        elif data['eventName'] == 'kill':
-            with self.pool.connection() as conn:
-                with conn.transaction():
-                    # Player is not an AI
-                    if data['arg1'] != -1:
-                        if data['arg4'] != -1:
-                            # selfkill
-                            if data['arg1'] == data['arg4']:
-                                kill_type = 'self_kill'
-                            # teamkills
-                            elif data['arg3'] == data['arg6']:
-                                kill_type = 'teamkill'
-                            # PVP
-                            elif data['victimCategory'] == 'Planes':
-                                kill_type = 'pvp_planes'
-                            elif data['victimCategory'] == 'Helicopters':
-                                kill_type = 'pvp_helicopters'
-                        elif data['victimCategory'] == 'Planes':
-                            kill_type = 'kill_planes'
-                        elif data['victimCategory'] == 'Helicopters':
-                            kill_type = 'kill_helicopters'
-                        elif data['victimCategory'] == 'Ships':
-                            kill_type = 'kill_ships'
-                        elif data['victimCategory'] == 'Air Defence':
-                            kill_type = 'kill_sams'
-                        elif data['victimCategory'] in ['Unarmed', 'Armor', 'Infantry', 'Fortification', 'Artillery',
-                                                        'MissilesSS']:
-                            kill_type = 'kill_ground'
-                        else:
-                            kill_type = 'kill_other'  # Static objects
-                        if kill_type in self.SQL_EVENT_UPDATES.keys():
-                            pilot: Player = server.get_player(id=data['arg1'])
-                            for crew_member in server.get_crew_members(pilot):
-                                conn.execute(self.SQL_EVENT_UPDATES[kill_type], (server.mission_id, crew_member.ucid))
+                conn.execute(self.SQL_EVENT_UPDATES[data['eventName']], (server.mission_id, player.ucid))
 
-                    # Victim is not an AI
-                    if data['arg4'] != -1:
-                        if data['arg1'] != -1:
-                            if data['arg1'] == data['arg4']:  # self kill
-                                death_type = 'self_kill'
-                            elif data['arg3'] == data['arg6']:  # killed by team member - no death counted
-                                death_type = 'teamdeath'
-                            # PVP
-                            elif data['killerCategory'] == 'Planes':
-                                death_type = 'deaths_pvp_planes'
-                            elif data['killerCategory'] == 'Helicopters':
-                                death_type = 'deaths_pvp_helicopters'
-                        elif data['killerCategory'] == 'Planes':
-                            death_type = 'deaths_planes'
-                        elif data['killerCategory'] == 'Helicopters':
-                            death_type = 'deaths_helicopters'
-                        elif data['killerCategory'] == 'Ships':
-                            death_type = 'deaths_ships'
-                        elif data['killerCategory'] == 'Air Defence':
-                            death_type = 'deaths_sams'
-                        elif data['killerCategory'] in ['Armor', 'Infantry' 'Fortification', 'Artillery',
-                                                        'MissilesSS']:
-                            death_type = 'deaths_ground'
-                        else:
-                            death_type = 'other'
-                        if death_type in self.SQL_EVENT_UPDATES.keys():
-                            pilot: Player = server.get_player(id=data['arg4'])
-                            for crew_member in server.get_crew_members(pilot):
-                                conn.execute(self.SQL_EVENT_UPDATES[death_type], (server.mission_id, crew_member.ucid))
-        elif data['eventName'] in ['takeoff', 'landing', 'crash', 'pilot_death']:
-            if data['arg1'] != -1:
-                if data['eventName'] in self.SQL_EVENT_UPDATES.keys():
-                    with self.pool.connection() as conn:
-                        with conn.transaction():
-                            player: Player = server.get_player(id=data['arg1'])
-                            if not player:
-                                return
-                            conn.execute(self.SQL_EVENT_UPDATES[data['eventName']],
-                                         (server.mission_id, player.ucid))
-        elif data['eventName'] == 'eject':
-            if data['arg1'] != -1:
-                if data['eventName'] in self.SQL_EVENT_UPDATES.keys():
-                    # TODO: when DCS bug wih multicrew eject gets fixed, change this to single player only
-                    pilot: Player = server.get_player(id=data['arg1'])
-                    crew_members = server.get_crew_members(pilot)
-                    if len(crew_members) == 1:
-                        with self.pool.connection() as conn:
-                            with conn.transaction():
-                                conn.execute(self.SQL_EVENT_UPDATES[data['eventName']],
-                                             (server.mission_id, crew_members[0].ucid))
-        elif data['eventName'] == 'mission_end':
-            config = self.get_config(server)
-            if 'highscore' in config:
-                await self.plugin.render_highscore(config['highscore'], server, True)
+    def _handle_eject_event(self, conn: Connection, server: Server, data: dict) -> None:
+        if data['arg1'] != -1:
+            if data['eventName'] in self.SQL_EVENT_UPDATES.keys():
+                # TODO: when DCS bug wih multicrew eject gets fixed, change this to single player only
+                pilot: Player = server.get_player(id=data['arg1'])
+                crew_members = server.get_crew_members(pilot)
+                if len(crew_members) == 1:
+                    conn.execute(self.SQL_EVENT_UPDATES[data['eventName']], (server.mission_id, crew_members[0].ucid))
 
-    @chat_command(name="linkme", usage="<token>", help="link your user to Discord")
-    async def linkme(self, server: Server, player: Player, params: list[str]):
-        if not params:
-            player.sendChatMessage(f"Syntax: {self.prefix}linkme token\nYou get the token with /linkme in our Discord.")
-            return
+    @event(name="onGameEvent")
+    async def onGameEvent(self, server: Server, data: dict) -> None:
+        event_name = data['eventName']
 
-        token = params[0]
         with self.pool.connection() as conn:
             with conn.transaction():
-                with closing(conn.cursor()) as cursor:
-                    row = cursor.execute('SELECT discord_id FROM players WHERE ucid = %s', (token,)).fetchone()
-                    if not row:
-                        player.sendChatMessage('Invalid token.')
-                        await self.bot.get_admin_channel(server).send(
-                            f'Player {player.display_name} (ucid={player.ucid}) entered a non-existent linking token.')
-                    else:
-                        discord_id = row[0]
-                        member = DataObjectFactory().new('Member', node=self.node,
-                                                         member=self.bot.guilds[0].get_member(discord_id))
+                if event_name == 'disconnect':
+                    self._handle_disconnect_event(conn, server, data)
+                    return
+                elif event_name == 'kill':
+                    self._handle_kill_event(conn, server, data)
+                    return
+                elif event_name in ['takeoff', 'landing', 'crash', 'pilot_death']:
+                    self._handle_common_event(conn, server, data)
+                    return
+                elif event_name == 'eject':
+                    self._handle_eject_event(conn, server, data)
+                    return
+        # do not block the database connection for too long
+        if event_name == 'mission_end':
+            config = self.get_config(server)
+            if 'highscore' in config:
+                # noinspection PyAsyncCall
+                # noinspection PyUnresolvedReferences
+                asyncio.create_task(self.plugin.render_highscore(config['highscore'], server, True))
 
-                        old_ucid = member.ucid if member.verified else None
-                        if old_ucid:
-                            member.ucid = player.ucid
-                        else:
-                            player.member = member.member
-                        member.verified = True
-                        cursor.execute('DELETE FROM players WHERE ucid = %s', (token,))
-                        # make sure we update all tables with the new UCID
-                        if old_ucid and old_ucid != player.ucid:
-                            for plugin in self.bot.cogs.values():  # type: Plugin
-                                await plugin.update_ucid(conn, old_ucid, player.ucid)
-                            await self.bot.audit(f'changed UCID from {old_ucid} to {player.ucid}.', user=player.member)
-                            player.sendChatMessage('Your account has been updated.')
-                        elif not old_ucid:
-                            await self.bot.audit(
-                                f'self-linked to DCS user "{player.display_name}" (ucid={player.ucid}).',
-                                user=player.member)
-                            player.sendChatMessage('Your user has been linked.')
-                        else:
-                            player.sendChatMessage('Your user was linked already!')
+    @event(name="onMemberLinked")
+    async def onMemberLinked(self, server: Server, data: dict) -> None:
+        member = self.bot.guilds[0].get_member(data['discord_id'])
+        roles = [x.id for x in member.roles]
+        try:
+            # get possible squadron roles
+            async with self.apool.connection() as conn:
+                async with conn.transaction():
+                    async for row in await conn.execute('SELECT id, role FROM squadrons WHERE role IS NOT NULL'):
+                        # do we have to add the member to a squadron?
+                        if row[1] in roles:
+                            await conn.execute("""
+                                INSERT INTO squadron_members VALUES (%s, %s) 
+                                ON CONFLICT (squadron_id, player_ucid) DO NOTHING
+                            """, (row[0], data['ucid']))
+        except Exception as ex:
+            self.log.exception(ex)
+
+    @event(name="onMemberUnlinked")
+    async def onMemberUnlinked(self, server: Server, data: dict) -> None:
+        try:
+            async with self.apool.connection() as conn:
+                async with conn.transaction():
+                    await conn.execute("""
+                        DELETE FROM squadron_members WHERE player_ucid = %s AND squadron_id IN (
+                            SELECT id FROM squadrons WHERE role IS NOT NULL
+                        ) 
+                    """, (data['ucid'], ))
+        except Exception as ex:
+            self.log.exception(ex)

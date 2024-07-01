@@ -1,20 +1,22 @@
 from __future__ import annotations
 import asyncio
 import logging
-import logging.handlers
 import re
 
 from core import Service, ServiceRegistry, Status
 from datetime import datetime
 from logging.handlers import QueueHandler, RotatingFileHandler
 from queue import Queue
-from rich.console import Console, ConsoleOptions, RenderResult
+from rich.console import Console, ConsoleOptions, RenderResult, ConsoleRenderable, Group
 from rich.layout import Layout
 from rich.live import Live
+from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.table import Table
-from services import ServiceBus
-from typing import cast, TYPE_CHECKING, Optional
+from rich.traceback import Traceback
+from typing import TYPE_CHECKING, Optional
+
+from ..servicebus import ServiceBus
 
 if TYPE_CHECKING:
     from core import Node
@@ -26,7 +28,7 @@ __all__ = [
 
 class HeaderWidget:
     """Display header with clock."""
-    def __init__(self, service: Service):
+    def __init__(self, service: "Dashboard"):
         self.service = service
         self.node = service.node
         self.log = service.log
@@ -44,12 +46,13 @@ class HeaderWidget:
         message += (f"DCSServerBot Version {self.node.bot_version}.{self.node.sub_version} | "
                     f"DCS Version {self.service.dcs_version}[/]")
         grid.add_row(message, datetime.now().ctime().replace(":", "[blink]:[/]"))
-        return Panel(grid, style="white on blue")
+        return Panel(grid, style=self.service.get_config().get("header", {}).get("background", "white on navy_blue"),
+                     border_style=self.service.get_config().get("header", {}).get("border", "white"))
 
 
 class ServersWidget:
     """Displaying List of Servers"""
-    def __init__(self, service: Service):
+    def __init__(self, service: "Dashboard"):
         self.service = service
         self.bus = service.bus
 
@@ -71,12 +74,14 @@ class ServersWidget:
                 table.add_row(server.status.name.title(), name, mission_name, num_players, server.node.name)
             else:
                 table.add_row(server.status.name.title(), name, mission_name, num_players)
-        return Panel(table, title="Servers", padding=1)
+        return Panel(table, title="[b]Servers", padding=1,
+                     style=self.service.get_config().get("servers", {}).get("background", "white on dark_blue"),
+                     border_style=self.service.get_config().get("servers", {}).get("border", "white"))
 
 
 class NodeWidget:
     """Displaying Bot Info"""
-    def __init__(self, service: Service):
+    def __init__(self, service: "Dashboard"):
         self.service = service
         self.node = service.node
         self.bus = service.bus
@@ -102,47 +107,77 @@ class NodeWidget:
                 table.add_row(f"[green]{node.name}[/]", f"{servers[node.name]}/{len(node.instances)}")
             else:
                 table.add_row(node.name, f"{servers[node.name]}/{len(node.instances)}")
-        return Panel(table, title="Nodes", padding=1)
+        return Panel(table, title="[b]Nodes", padding=1,
+                     style=self.service.get_config().get("nodes", {}).get("background", "white on dark_blue"),
+                     border_style=self.service.get_config().get("nodes", {}).get("border", "white"))
 
 
 class LogWidget:
     """Display log messages"""
-    def __init__(self, queue: Queue):
-        self.queue = queue
-        self.buffer: list[str] = []
+    def __init__(self, service: "Dashboard"):
+        self.service = service
+        self.queue = service.queue
+        self.buffer: list[ConsoleRenderable] = []
+        self.handler = service.old_handler
 
-    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+    def _emit(self, record: logging.LogRecord) -> ConsoleRenderable:
+        message = self.handler.format(record)
+        traceback = None
+        if (
+            self.handler.rich_tracebacks
+            and record.exc_info
+            and record.exc_info != (None, None, None)
+        ):
+            exc_type, exc_value, exc_traceback = record.exc_info
+            assert exc_type is not None
+            assert exc_value is not None
+            traceback = Traceback.from_exception(
+                exc_type,
+                exc_value,
+                exc_traceback,
+                width=self.handler.tracebacks_width,
+                extra_lines=self.handler.tracebacks_extra_lines,
+                theme=self.handler.tracebacks_theme,
+                word_wrap=self.handler.tracebacks_word_wrap,
+                show_locals=self.handler.tracebacks_show_locals,
+                locals_max_length=self.handler.locals_max_length,
+                locals_max_string=self.handler.locals_max_string,
+                suppress=self.handler.tracebacks_suppress,
+            )
+            message = record.getMessage()
+            if self.handler.formatter:
+                record.message = record.getMessage()
+                formatter = self.handler.formatter
+                if hasattr(formatter, "usesTime") and formatter.usesTime():
+                    record.asctime = formatter.formatTime(record, formatter.datefmt)
+                message = formatter.formatMessage(record)
+
+        message_renderable = self.handler.render_message(record, message)
+        return self.handler.render(
+            record=record, traceback=traceback, message_renderable=message_renderable
+        )
+
+    def __rich_console__(self, _: Console, options: ConsoleOptions) -> RenderResult:
         while not self.queue.empty():
-            rec: logging.LogRecord = self.queue.get()
-            for msg in rec.getMessage().splitlines():
-                if rec.levelno == logging.INFO:
-                    msg = "[green]" + msg + "[/]"
-                elif rec.levelno == logging.WARNING:
-                    msg = "[yellow]" + msg + "[/]"
-                elif rec.levelno == logging.ERROR:
-                    msg = "[red]" + msg + "[/]"
-                elif rec.levelno == logging.FATAL:
-                    msg = "[bold red]" + msg + "[/]"
-                self.buffer.append(msg)
+            record: logging.LogRecord = self.queue.get()
+            log_renderable = self._emit(record)
+            self.buffer.append(log_renderable)
+
         height = options.max_height - 2
-        width = options.max_width - 5
-        msg = ""
-        init = len(self.buffer) + 1 - height if len(self.buffer) > height else 0
-        for i in range(init, len(self.buffer)):
-            if len(self.buffer[i]) > width:
-                msg += self.buffer[i][:width - 4] + '...\n'
-            else:
-                msg += self.buffer[i] + '\n'
-        if len(self.buffer) > 100:
-            self.buffer = self.buffer[-100:]
-        yield Panel(msg, title="Log")
+        if len(self.buffer) > height:
+            self.buffer = self.buffer[-height:]
+
+        log_content = Group(*self.buffer)
+        yield Panel(log_content, title="[b]Log", height=options.max_height,
+                    style=self.service.get_config().get("log", {}).get("background", "white on grey15"),
+                    border_style=self.service.get_config().get("log", {}).get("border", "white"))
 
 
-@ServiceRegistry.register("Dashboard")
+@ServiceRegistry.register()
 class Dashboard(Service):
 
-    def __init__(self, node, name: str):
-        super().__init__(node, name)
+    def __init__(self, node):
+        super().__init__(node)
         self.console = Console()
         self.layout = None
         self.bus = None
@@ -158,39 +193,42 @@ class Dashboard(Service):
         return len(self.node.all_nodes) > 1
 
     def create_layout(self):
+        header = HeaderWidget(self)
+        servers = ServersWidget(self)
+        log = LogWidget(self)
         layout = Layout()
         layout.split(
-            Layout(name="header", size=3),
-            Layout(name="main"),
-            Layout(name="log", ratio=2, minimum_size=5),
+            Layout(header, name="header", size=3),
+            Layout(servers, name="main"),
+            Layout(log, name="log", ratio=2, minimum_size=5)
         )
         if self.node.master and self.is_multinode():
-            layout['main'].split_row(Layout(name="servers", ratio=2), Layout(name="nodes"))
+            servers = ServersWidget(self)
+            nodes = NodeWidget(self)
+            layout['main'].split_row(Layout(servers, name="servers", ratio=2), Layout(nodes, name="nodes"))
         return layout
 
     def hook_logging(self):
-        formatter = logging.Formatter(fmt=u'%(asctime)s.%(msecs)03d %(levelname)s\t%(message)s',
-                                      datefmt='%Y-%m-%d %H:%M:%S')
         self.queue = Queue()
         self.log_handler = QueueHandler(self.queue)
         self.log_handler.setLevel(logging.INFO)
-        self.log_handler.setFormatter(formatter)
-        self.log.addHandler(self.log_handler)
-        for handler in self.log.handlers:
-            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, RotatingFileHandler):
+        for handler in self.log.root.handlers:
+            if isinstance(handler, RichHandler) and not isinstance(handler, RotatingFileHandler):
                 self.old_handler = handler
-                self.log.removeHandler(handler)
+                self.log_handler.setFormatter(handler.formatter)
+                self.log.root.removeHandler(handler)
+                self.log.root.addHandler(self.log_handler)
 
     def unhook_logging(self):
-        self.log.removeHandler(self.log_handler)
-        self.log.addHandler(self.old_handler)
+        self.log.root.removeHandler(self.log_handler)
+        self.log.root.addHandler(self.old_handler)
 
     async def start(self):
         await super().start()
-        self.layout = self.create_layout()
-        self.bus = cast(ServiceBus, ServiceRegistry.get("ServiceBus"))
-        self.dcs_branch, self.dcs_version = await self.node.get_dcs_branch_and_version()
+        self.bus = ServiceRegistry.get(ServiceBus)
         self.hook_logging()
+        self.dcs_branch, self.dcs_version = await self.node.get_dcs_branch_and_version()
+        self.layout = self.create_layout()
         self.stop_event.clear()
         self.update_task = asyncio.create_task(self.update())
 
@@ -203,26 +241,9 @@ class Dashboard(Service):
         await super().stop()
 
     async def update(self):
-        header = HeaderWidget(self)
-        servers = ServersWidget(self)
-        nodes = NodeWidget(self)
-        log = LogWidget(self.queue)
-
-        def do_update():
-            self.layout['header'].update(header)
-            if self.node.master and self.is_multinode():
-                self.layout['servers'].update(servers)
-                self.layout['nodes'].update(nodes)
-            else:
-                self.layout['main'].update(servers)
-            self.layout['log'].update(log)
-
         try:
-            do_update()
-            with Live(self.layout, refresh_per_second=1, screen=True):
-                while not self.stop_event.is_set():
-                    do_update()
-                    await asyncio.sleep(1)
+            with Live(self.layout, refresh_per_second=1, screen=False):
+                await self.stop_event.wait()
         except Exception as ex:
             self.log.exception(ex)
             await self.stop()

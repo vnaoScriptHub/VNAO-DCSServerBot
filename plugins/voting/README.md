@@ -6,6 +6,12 @@ You can define who can create a new voting, and you can define who can participa
 with the [CreditSystem](../creditsystem/README.md), meaning you can make votes cost credits if you like.
 
 ## Configuration
+As Voting is an optional plugin, you need to activate it in main.yaml first like so:
+```yaml
+opt_plugins:
+  - voting
+```
+
 The plugin can be configured via yaml in config/plugins/voting.yaml:
 ```yaml
 DEFAULT:
@@ -38,6 +44,8 @@ DEFAULT:
   voting_threshold: 0.25  # 25% of all players have to vote for the vote to count
   voting_rule: "majority" # one of "majority" (default), "supermajority" (>= 33%), "unanimous" or "absolute" (>= 50%)
   credits: 10             # a vote costs 10 credit points (default: 0 = off)
+instance2:
+  enabled: false        # Disable the Voting plugin on instance2
 ```
 
 If you don't want to provide a list of presets or missions, just send an empty tag like so:
@@ -49,13 +57,12 @@ DEFAULT:
 ```
 
 ## In-Game Commands
-
 | Command | Parameter          | Description                                      |
 |---------|--------------------|--------------------------------------------------|
-| .vote   | \<what\> \[param\] | Start a voting .                                 | 
-| .vote   | cancel             | Cancel a voting (only DCS Admin can do that).    |
-| .vote   | <num>              | Vote for one of the options.                     |
-| .vote   |                    | Display the current voting and the leading vote. |
+| -vote   | \<what\> \[param\] | Start a voting .                                 | 
+| -vote   | cancel             | Cancel a voting (only DCS Admin can do that).    |
+| -vote   | <num>              | Vote for one of the options.                     |
+| -vote   |                    | Display the current voting and the leading vote. |
 
 A voting will automatically end after `time` seconds and execute the result.
 

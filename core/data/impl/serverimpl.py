@@ -3,25 +3,33 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import psutil
 import shutil
 import socket
 import subprocess
+import sys
+import traceback
 
+if sys.platform == 'win32':
+    import win32con
+    import win32gui
+
+from collections import OrderedDict
 from contextlib import suppress
 from copy import deepcopy
 from core import utils, Server
 from core.data.dataobject import DataObjectFactory
-from core.data.const import Status, Channel
+from core.data.const import Status, Channel, Coalition
 from core.mizfile import MizFile, UnsupportedMizFileException
 from core.data.node import UploadStatus
+from core.utils.performance import performance_log
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum
 from pathlib import Path, PurePath
 from psutil import Process
 from typing import Optional, TYPE_CHECKING, Union, Any
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileSystemEvent, FileSystemMovedEvent
+from watchdog.events import FileSystemEventHandler
 
 
 # ruamel YAML support
@@ -31,24 +39,27 @@ yaml = YAML()
 if TYPE_CHECKING:
     from core import Extension, Instance
     from services import DCSServerBot
+    from watchdog.events import FileSystemEvent, FileSystemMovedEvent
 
 __all__ = ["ServerImpl"]
 
 
 class MissionFileSystemEventHandler(FileSystemEventHandler):
-    def __init__(self, server: Server):
+    def __init__(self, server: Server, loop: asyncio.AbstractEventLoop):
         self.server = server
         self.log = server.log
+        self.loop = loop
 
     def on_created(self, event: FileSystemEvent):
         path: str = os.path.normpath(event.src_path)
-        if path.endswith('.miz'):
-            if self.server.status in [Status.RUNNING, Status.PAUSED, Status.STOPPED]:
-                self.server.send_to_dcs({"command": "addMission", "path": path})
-            else:
-                missions = self.server.settings['missionList']
-                missions.append(path)
-            self.log.info(f"=> New mission {os.path.basename(path)[:-4]} added to server {self.server.name}.")
+        if not path.endswith('.miz'):
+            return
+        if self.server.status in [Status.RUNNING, Status.PAUSED, Status.STOPPED]:
+            self.loop.create_task(self.server.send_to_dcs({"command": "addMission", "path": path}))
+        else:
+            missions = self.server.settings['missionList']
+            missions.append(path)
+        self.log.info(f"=> New mission {os.path.basename(path)[:-4]} added to server {self.server.name}.")
 
     def on_moved(self, event: FileSystemMovedEvent):
         self.on_deleted(event)
@@ -66,15 +77,17 @@ class MissionFileSystemEventHandler(FileSystemEventHandler):
                     self.log.fatal(f'The running mission on server {self.server.name} got deleted!')
                     return
                 else:
-                    self.server.send_to_dcs({"command": "deleteMission", "id": idx})
+                    self.loop.create_task(self.server.send_to_dcs({"command": "deleteMission", "id": idx}))
             else:
                 missions.remove(path)
                 self.server.settings['missionList'] = missions
             self.log.info(f"=> Mission {os.path.basename(path)[:-4]} deleted from server {self.server.name}.")
+        else:
+            self.log.debug(f"Mission file {path} got deleted from disk.")
 
 
 @dataclass
-@DataObjectFactory.register("Server")
+@DataObjectFactory.register()
 class ServerImpl(Server):
     bot: Optional[DCSServerBot] = field(compare=False, init=False)
     event_handler: MissionFileSystemEventHandler = field(compare=False, default=None)
@@ -82,6 +95,7 @@ class ServerImpl(Server):
 
     def __post_init__(self):
         super().__post_init__()
+        self.lock = asyncio.Lock()
         with self.pool.connection() as conn:
             with conn.transaction():
                 conn.execute("INSERT INTO servers (server_name) VALUES (%s) ON CONFLICT DO NOTHING", (self.name, ))
@@ -116,7 +130,6 @@ class ServerImpl(Server):
                 self._settings['missionList'] = []
             elif isinstance(self._settings['missionList'], dict):
                 self._settings['missionList'] = list(self._settings['missionList'].values())
-            self._settings['missionList'] = [os.path.normpath(x) for x in self._settings['missionList']]
         return self._settings
 
     @property
@@ -127,7 +140,7 @@ class ServerImpl(Server):
             # no options.lua, create a minimalistic one
             if 'graphics' not in self._options:
                 self._options["graphics"] = {
-                        "visibRange": "High"
+                    "visibRange": "High"
                 }
             if 'plugins' not in self._options:
                 self._options["plugins"] = {}
@@ -149,7 +162,7 @@ class ServerImpl(Server):
                 if (self._status in [Status.UNREGISTERED, Status.LOADING, Status.SHUTDOWN]
                         and status in [Status.STOPPED, Status.PAUSED, Status.RUNNING]):
                     if not self.observer.emitters:
-                        self.observer.schedule(self.event_handler, self.instance.missions_dir, recursive=False)
+                        self.observer.schedule(self.event_handler, self.instance.missions_dir, recursive=True)
                         self.log.info(f'  => {self.name}: Auto-scanning for new miz files in Missions-folder enabled.')
                 elif status == Status.SHUTDOWN:
                     if self._status == Status.UNREGISTERED:
@@ -169,6 +182,18 @@ class ServerImpl(Server):
                     elif self.observer.emitters:
                         self.observer.unschedule_all()
                         self.log.info(f'  => {self.name}: Auto-scanning for new miz files in Missions-folder disabled.')
+            elif self._status == Status.UNREGISTERED and status == Status.SHUTDOWN:
+                # make sure, mission names are unique
+                current_mission = self._get_current_mission_file()
+                if current_mission:
+                    self._settings['missionList'] = list(
+                        OrderedDict.fromkeys(os.path.normpath(x) for x in self._settings['missionList']).keys()
+                    )
+                    try:
+                        new_start = self._settings['missionList'].index(current_mission)
+                    except ValueError:
+                        new_start = 0
+                    self._settings['listStartIndex'] = new_start + 1
             super().set_status(status)
 
     def _install_luas(self):
@@ -223,11 +248,11 @@ class ServerImpl(Server):
         self._install_luas()
         # enable autoscan for missions changes
         if self.locals.get('autoscan', False):
-            self.event_handler = MissionFileSystemEventHandler(self)
+            self.event_handler = MissionFileSystemEventHandler(self, asyncio.get_event_loop())
             self.observer = Observer()
             self.observer.start()
 
-    async def get_current_mission_file(self) -> Optional[str]:
+    def _get_current_mission_file(self) -> Optional[str]:
         if not self.current_mission or not self.current_mission.filename:
             settings = self.settings
             start_index = int(settings.get('listStartIndex', 1))
@@ -240,16 +265,21 @@ class ServerImpl(Server):
                     if os.path.exists(filename):
                         settings['listStartIndex'] = idx + 1
                         break
+                    else:
+                        self.log.warning(f"Non-existent mission {filename} in your missionList!")
                 else:
                     filename = None
         else:
             filename = self.current_mission.filename
         return os.path.normpath(filename) if filename else None
 
+    async def get_current_mission_file(self) -> Optional[str]:
+        return self._get_current_mission_file()
+
     async def get_current_mission_theatre(self) -> Optional[str]:
         filename = await self.get_current_mission_file()
         if filename:
-            miz = MizFile(self.node, filename)
+            miz = await asyncio.to_thread(MizFile, filename)
             return miz.theatre
 
     def serialize(self, message: dict):
@@ -270,7 +300,7 @@ class ServerImpl(Server):
             message[key] = _serialize_value(value)
         return message
 
-    def send_to_dcs(self, message: dict):
+    async def send_to_dcs(self, message: dict):
         # As Lua does not support large numbers, convert them to strings
         message = self.serialize(deepcopy(message))
         msg = json.dumps(message)
@@ -297,16 +327,18 @@ class ServerImpl(Server):
         old_name = self.name
         try:
             # rename the server in the database
-            with self.pool.connection() as conn:
-                with conn.transaction():
+            async with self.apool.connection() as conn:
+                async with conn.transaction():
                     # we need to remove any older server that might have had the same name
-                    conn.execute('DELETE FROM servers WHERE server_name = %s', (new_name, ))
-                    conn.execute('UPDATE servers SET server_name = %s WHERE server_name = %s',
-                                 (new_name, self.name))
-                    conn.execute('UPDATE instances SET server_name = %s WHERE server_name = %s',
-                                 (new_name, self.name))
-                    conn.execute('UPDATE message_persistence SET server_name = %s WHERE server_name = %s',
-                                 (new_name, self.name))
+                    await conn.execute('DELETE FROM servers WHERE server_name = %s', (new_name, ))
+                    await conn.execute('UPDATE servers SET server_name = %s WHERE server_name = %s',
+                                       (new_name, self.name))
+                    await conn.execute('DELETE FROM instances WHERE server_name = %s', (new_name, ))
+                    await conn.execute('UPDATE instances SET server_name = %s WHERE server_name = %s',
+                                       (new_name, self.name))
+                    await conn.execute('DELETE FROM message_persistence WHERE server_name = %s', (new_name, ))
+                    await conn.execute('UPDATE message_persistence SET server_name = %s WHERE server_name = %s',
+                                       (new_name, self.name))
                     # only the master can take care of a cluster-wide rename
                     if self.node.master:
                         await self.node.rename_server(self, new_name)
@@ -325,13 +357,14 @@ class ServerImpl(Server):
                 # update servers.yaml
                 update_config(old_name, new_name, update_settings)
                 self.name = new_name
-            except Exception as ex:
+            except Exception:
                 # rollback config
                 update_config(new_name, old_name, update_settings)
                 raise
-        except Exception as ex:
+        except Exception:
             self.log.exception(f"Error during renaming of server {old_name} to {new_name}: ", exc_info=True)
 
+    @performance_log()
     def do_startup(self):
         basepath = self.node.installation
         for exe in ['DCS_server.exe', 'DCS.exe']:
@@ -341,19 +374,34 @@ class ServerImpl(Server):
         else:
             self.log.error(f"No executable found to start a DCS server in {basepath}!")
             return
-#        # check if all missions are existing
-#        missions = [x for x in self.settings['missionList'] if os.path.exists(x)]
-#        if len(missions) != len(self.settings['missionList']):
-#            self.settings['missionList'] = missions
-#            self.log.warning('Removed non-existent missions from serverSettings.lua')
+        # check if all missions are existing
+        missions = []
+        for mission in self.settings['missionList']:
+            if '.dcssb' in mission:
+                secondary = os.path.join(os.path.dirname(os.path.dirname(mission)), os.path.basename(mission))
+            else:
+                secondary = os.path.join(os.path.dirname(mission), '.dcssb', os.path.basename(mission))
+            if os.path.exists(mission):
+                missions.append(mission)
+            elif os.path.exists(secondary):
+                missions.append(secondary)
+            else:
+                self.log.warning(f"Removing mission {mission} from serverSettings.lua as it could not be found!")
+        if len(missions) != len(self.settings['missionList']):
+            self.settings['missionList'] = missions
+            self.log.warning('Removed non-existent missions from serverSettings.lua')
         self.log.debug(r'Launching DCS server with: "{}" --server --norender -w {}'.format(path, self.instance.name))
         try:
             p = subprocess.Popen(
-                [exe, '--server', '--norender', '-w', self.instance.name], executable=path
+                [exe, '--server', '--norender', '-w', self.instance.name], executable=path, close_fds=True
             )
             self.process = Process(p.pid)
-            self.log.debug(f"  => DCS server starting up with PID {p.pid}")
-        except Exception as ex:
+            if 'priority' in self.locals:
+                self.set_priority(self.locals.get('priority'))
+            if 'affinity' in self.locals:
+                self.set_affinity(self.locals.get('affinity'))
+            self.log.info(f"  => DCS server starting up with PID {p.pid}")
+        except Exception:
             self.log.error(f"  => Error while trying to launch DCS!", exc_info=True)
             self.process = None
 
@@ -379,64 +427,122 @@ class ServerImpl(Server):
             except Exception as ex:
                 self.log.exception(ex)
 
-    async def startup(self, modify_mission: Optional[bool] = True) -> None:
-        await self.init_extensions()
+    async def prepare_extensions(self):
         for ext in self.extensions.values():
             try:
                 await ext.prepare()
             except Exception as ex:
                 self.log.error(f"  => Error during {ext.name}.prepare(): {ex}. Skipped.")
+
+    @staticmethod
+    def _window_enumeration_handler(hwnd, top_windows):
+        top_windows.append((hwnd, win32gui.GetWindowText(hwnd)))
+
+    def _minimize(self):
+        top_windows = []
+        win32gui.EnumWindows(self._window_enumeration_handler, top_windows)
+
+        # Fetch the window name of the process
+        window_name = self.instance.name
+
+        for i in top_windows:
+            if window_name.lower() in i[1].lower():
+                win32gui.ShowWindow(i[0], win32con.SW_MINIMIZE)
+                break
+
+    def set_priority(self, priority: str):
+        if priority == 'below_normal':
+            self.log.info("  => Setting process priority to BELOW NORMAL.")
+            p = psutil.BELOW_NORMAL_PRIORITY_CLASS
+        elif priority == 'above_normal':
+            self.log.info("  => Setting process priority to ABOVE NORMAL.")
+            p = psutil.ABOVE_NORMAL_PRIORITY_CLASS
+        elif priority == 'high':
+            self.log.info("  => Setting process priority to HIGH.")
+            p = psutil.HIGH_PRIORITY_CLASS
+        elif priority == 'realtime':
+            self.log.warning("  => Setting process priority to REALTIME. Handle with care!")
+            p = psutil.REALTIME_PRIORITY_CLASS
+        else:
+            p = psutil.NORMAL_PRIORITY_CLASS
+        self.process.nice(p)
+
+    def set_affinity(self, affinity: Union[list[int], str]):
+        if isinstance(affinity, str):
+            affinity = [int(x.strip()) for x in affinity.split(',')]
+        elif isinstance(affinity, int):
+            affinity = [affinity]
+        self.log.info("  => Setting process affinity to {}".format(','.join(map(str, affinity))))
+        self.process.cpu_affinity(affinity)
+
+    async def startup(self, modify_mission: Optional[bool] = True) -> None:
+        await self.init_extensions()
+        await self.prepare_extensions()
         if modify_mission:
             await self.apply_mission_changes()
-        await asyncio.create_task(asyncio.to_thread(self.do_startup))
+        await asyncio.to_thread(self.do_startup)
         timeout = 300 if self.node.locals.get('slow_system', False) else 180
         self.status = Status.LOADING
         try:
-            await self.wait_for_status_change([Status.STOPPED, Status.PAUSED, Status.RUNNING], timeout)
+            await self.wait_for_status_change([Status.SHUTDOWN, Status.STOPPED, Status.PAUSED, Status.RUNNING], timeout)
+            if self.status == Status.SHUTDOWN:
+                raise TimeoutError()
+            if sys.platform == 'win32' and self.node.locals.get('DCS', {}).get('minimized', True):
+                self._minimize()
         except (TimeoutError, asyncio.TimeoutError):
-            # server crashed during launch
-            if not await self.is_running():
+            # server crashed during launch?
+            if self.status != Status.SHUTDOWN and not await self.is_running():
                 self.status = Status.SHUTDOWN
             raise
 
+    @performance_log()
     async def startup_extensions(self) -> None:
-        for ext in [x for x in self.extensions.values() if not x.is_running()]:
-            try:
-                await ext.startup()
-            except Exception as ex:
-                self.log.exception(ex)
+        not_running_extensions = [
+            ext for ext in self.extensions.values() if not await asyncio.to_thread(ext.is_running)
+        ]
+        startup_coroutines = [ext.startup() for ext in not_running_extensions]
+
+        results = await asyncio.gather(*startup_coroutines, return_exceptions=True)
+
+        for res in results:
+            if isinstance(res, Exception):
+                tb_str = "".join(
+                    traceback.format_exception(type(res), res, res.__traceback__))
+                self.log.error(f"Error during startup_extension(): %s", tb_str)
 
     async def shutdown_extensions(self) -> None:
-        for ext in [x for x in self.extensions.values() if x.is_running()]:
-            try:
-                await ext.shutdown()
-            except Exception as ex:
-                self.log.exception(ex)
+        running_extensions = [
+            ext for ext in self.extensions.values() if await asyncio.to_thread(ext.is_running)
+        ]
+        shutdown_coroutines = [asyncio.to_thread(ext.shutdown) for ext in running_extensions]
+
+        results = await asyncio.gather(*shutdown_coroutines, return_exceptions=True)
+
+        for res in results:
+            if isinstance(res, Exception):
+                self.log.error(f"Error during shutdown_extension()", exc_info=True)
 
     async def shutdown(self, force: bool = False) -> None:
         if await self.is_running():
             if not force:
                 await super().shutdown(False)
-            await self.terminate()
+            self._terminate()
         self.status = Status.SHUTDOWN
 
-    def _check_and_assign_process(self) -> bool:
-        if not self.process or not self.process.is_running():
-            self.process = utils.find_process("DCS_server.exe|DCS.exe", self.instance.name)
-        return self.process is not None
-
     async def is_running(self) -> bool:
-        # do we have a registered and running process?
-        if self._check_and_assign_process():
-            return True
-        # we might not have the necessary permissions to read the process
-        return utils.is_open('127.0.0.1', int(self.settings.get('port', 10308)))
+        async with self.lock:
+            if not self.process or not self.process.is_running():
+                self.process = await asyncio.to_thread(utils.find_process, "DCS_server.exe|DCS.exe", self.instance.name)
+            return self.process is not None
 
-    async def terminate(self) -> None:
-        if await self.is_running():
-            self.process.kill()
+    def _terminate(self) -> None:
+        if self.process and self.process.is_running():
+            self.process.terminate()
+            if self.process.is_running():
+                self.process.kill()
         self.process = None
 
+    @performance_log()
     async def apply_mission_changes(self, filename: Optional[str] = None) -> str:
         # disable autoscan
         autoscan = self.locals.get('autoscan', False)
@@ -449,6 +555,9 @@ class ServerImpl(Server):
                 return filename
         new_filename = filename
         try:
+            # make a backup
+            if '.dcssb' not in filename and not os.path.exists(filename + '.orig'):
+                shutil.copy2(filename, filename + '.orig')
             # process all mission modifications
             dirty = False
             for ext in self.extensions.values():
@@ -459,9 +568,6 @@ class ServerImpl(Server):
             # we did not change anything in the mission
             if not dirty:
                 return filename
-            # make a backup
-            if '.dcssb' not in filename and not os.path.exists(filename + '.orig'):
-                shutil.copy2(filename, filename + '.orig')
             # check if the original mission can be written
             if filename != new_filename:
                 missions: list[str] = self.settings['missionList']
@@ -473,7 +579,7 @@ class ServerImpl(Server):
                 self.log.error(
                     f'The mission {filename} is not compatible with MizEdit. Please re-save it in DCS World.')
             else:
-                self.log.error(ex)
+                self.log.exception(ex)
             if filename != new_filename and os.path.exists(new_filename):
                 os.remove(new_filename)
             return filename
@@ -482,11 +588,12 @@ class ServerImpl(Server):
             if autoscan:
                 self.locals['autoscan'] = True
 
-    def keep_alive(self):
-        self.send_to_dcs({"command": "getMissionUpdate"})
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                conn.execute("""
+    async def keep_alive(self):
+        if self.status in [Status.RUNNING, Status.PAUSED, Status.STOPPED]:
+            await self.send_to_dcs({"command": "getMissionUpdate"})
+        async with self.apool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute("""
                     UPDATE instances SET last_seen = (now() AT TIME ZONE 'utc') 
                     WHERE node = %s AND server_name = %s
                 """, (self.node.name, self.name))
@@ -503,7 +610,7 @@ class ServerImpl(Server):
                 filename = name
                 break
         else:
-            filename = os.path.normpath(os.path.join(await self.get_missions_dir(), filename))
+            filename = os.path.normpath(os.path.join(self.instance.missions_dir, filename))
         rc = await self.node.write_file(filename, url, force)
         if rc != UploadStatus.OK:
             return rc
@@ -514,69 +621,17 @@ class ServerImpl(Server):
         return UploadStatus.OK
 
     async def listAvailableMissions(self) -> list[str]:
-        return [str(x) for x in sorted(Path(PurePath(await self.get_missions_dir())).glob("*.miz"))]
+        return [str(x) for x in sorted(Path(PurePath(self.instance.missions_dir)).glob("*.miz"))]
 
     async def getMissionList(self) -> list[str]:
         return self.settings.get('missionList', [])
 
     async def modifyMission(self, filename: str, preset: Union[list, dict]) -> str:
-        async def apply_preset(value: dict):
-            if 'start_time' in value:
-                miz.start_time = value['start_time']
-            if 'date' in value:
-                miz.date = datetime.strptime(value['date'], '%Y-%m-%d')
-            if 'temperature' in value:
-                miz.temperature = int(value['temperature'])
-            if 'clouds' in value:
-                if isinstance(value['clouds'], str):
-                    miz.clouds = {"preset": value['clouds']}
-                else:
-                    miz.clouds = value['clouds']
-            if 'wind' in value:
-                miz.wind = value['wind']
-            if 'groundTurbulence' in value:
-                miz.groundTurbulence = int(value['groundTurbulence'])
-            if 'enable_dust' in value:
-                miz.enable_dust = value['enable_dust']
-            if 'dust_density' in value:
-                miz.dust_density = int(value['dust_density'])
-            if 'qnh' in value:
-                miz.qnh = int(value['qnh'])
-            if 'enable_fog' in value:
-                miz.enable_fog = value['enable_fog']
-            if 'fog' in value:
-                miz.fog = value['fog']
-            if 'halo' in value:
-                miz.halo = value['halo']
-            if 'requiredModules' in value:
-                miz.requiredModules = value['requiredModules']
-            if 'accidental_failures' in value:
-                miz.accidental_failures = value['accidental_failures']
-            if 'forcedOptions' in value:
-                miz.forcedOptions = value['forcedOptions']
-            if 'miscellaneous' in value:
-                miz.miscellaneous = value['miscellaneous']
-            if 'difficulty' in value:
-                miz.difficulty = value['difficulty']
-            if 'files' in value:
-                miz.files = value['files']
-            if 'modify' in value:
-                miz.modify(value['modify'])
-
-        miz = MizFile(self, filename)
-        if isinstance(preset, list):
-            for p in preset:
-                if not isinstance(p, dict):
-                    self.log.error(f"{p} is not a dictionary!")
-                    continue
-                await apply_preset(p)
-        elif isinstance(preset, dict):
-            await apply_preset(preset)
-        else:
-            self.log.error(f"{preset} is not a dictionary!")
+        miz = await asyncio.to_thread(MizFile, filename)
+        await asyncio.to_thread(miz.apply_preset, preset)
         # write new mission
         new_filename = utils.create_writable_mission(filename)
-        miz.save(new_filename)
+        await asyncio.to_thread(miz.save, new_filename)
         return new_filename
 
     async def persist_settings(self):
@@ -613,22 +668,49 @@ class ServerImpl(Server):
 
     async def setStartIndex(self, mission_id: int) -> None:
         if self.status in [Status.STOPPED, Status.PAUSED, Status.RUNNING]:
-            self.send_to_dcs({"command": "setStartIndex", "id": mission_id})
+            await self.send_to_dcs({"command": "setStartIndex", "id": mission_id})
         else:
             self.settings['listStartIndex'] = mission_id
 
+    async def setPassword(self, password: str):
+        self.settings['password'] = password or ''
+
+    async def setCoalitionPassword(self, coalition: Coalition, password: str):
+        advanced = self.settings['advanced']
+        if coalition == Coalition.BLUE:
+            if password:
+                advanced['bluePasswordHash'] = utils.hash_password(password)
+            else:
+                del advanced['bluePasswordHash']
+        else:
+            if password:
+                advanced['redPasswordHash'] = utils.hash_password(password)
+            else:
+                del advanced['redPasswordHash']
+        self.settings['advanced'] = advanced
+        async with self.apool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute('UPDATE servers SET {} = %s WHERE server_name = %s'.format(
+                    'blue_password' if coalition == Coalition.BLUE else 'red_password'),
+                    (password, self.name))
+
     async def addMission(self, path: str, *, autostart: Optional[bool] = False) -> None:
         path = os.path.normpath(path)
+        if '.dcssb' in path:
+            secondary = os.path.join(os.path.dirname(os.path.dirname(path)), os.path.basename(path))
+        else:
+            secondary = os.path.join(os.path.dirname(path), '.dcssb', os.path.basename(path))
         missions = self.settings['missionList']
-        if path not in missions:
-            if self.status in [Status.STOPPED, Status.PAUSED, Status.RUNNING]:
-                data = await self.send_to_dcs_sync({"command": "addMission", "path": path, "autostart": autostart})
-                self.settings['missionList'] = data['missionList']
-            else:
-                missions.append(path)
-                self.settings['missionList'] = missions
-        elif autostart:
-            self.settings['listStartIndex'] = missions.index(path) + 1
+        if path in missions or secondary in missions:
+            return
+        if self.status in [Status.STOPPED, Status.PAUSED, Status.RUNNING]:
+            data = await self.send_to_dcs_sync({"command": "addMission", "path": path, "autostart": autostart})
+            self.settings['missionList'] = data['missionList']
+        else:
+            missions.append(path)
+            self.settings['missionList'] = missions
+            if autostart:
+                self.settings['listStartIndex'] = missions.index(path if path in missions else secondary) + 1
 
     async def deleteMission(self, mission_id: int) -> None:
         if self.status in [Status.PAUSED, Status.RUNNING] and self.mission_id == mission_id:
@@ -642,13 +724,14 @@ class ServerImpl(Server):
             self.settings['missionList'] = missions
 
     async def replaceMission(self, mission_id: int, path: str) -> None:
+        path = os.path.normpath(path)
         if self.status in [Status.STOPPED, Status.PAUSED, Status.RUNNING]:
             await self.send_to_dcs_sync({"command": "replaceMission", "index": mission_id, "path": path})
         else:
             missions: list[str] = self.settings['missionList']
             missions[mission_id - 1] = path
             self.settings['missionList'] = missions
-    
+
     async def loadMission(self, mission: Union[int, str], modify_mission: Optional[bool] = True) -> None:
         if isinstance(mission, int):
             if mission > len(self.settings['missionList']):
@@ -662,18 +745,36 @@ class ServerImpl(Server):
         try:
             idx = self.settings['missionList'].index(filename) + 1
             if idx == int(self.settings['listStartIndex']):
-                self.send_to_dcs({"command": "startMission", "filename": filename})
+                await self.send_to_dcs({"command": "startMission", "filename": filename})
             else:
-                self.send_to_dcs({"command": "startMission", "id": idx})
+                await self.send_to_dcs({"command": "startMission", "id": idx})
         except ValueError:
-            self.send_to_dcs({"command": "startMission", "filename": filename})
+            await self.send_to_dcs({"command": "startMission", "filename": filename})
         if not stopped:
             # wait for a status change (STOPPED or LOADING)
             await self.wait_for_status_change([Status.STOPPED, Status.LOADING], timeout=120)
         else:
-            self.send_to_dcs({"command": "start_server"})
+            await self.send_to_dcs({"command": "start_server"})
         # wait until we are running again
         await self.wait_for_status_change([Status.RUNNING, Status.PAUSED], timeout=300)
 
     async def loadNextMission(self, modify_mission: Optional[bool] = True) -> None:
         await self.loadMission(int(self.settings['listStartIndex']) + 1, modify_mission)
+
+    async def run_on_extension(self, extension: str, method: str, **kwargs) -> Any:
+        ext = self.extensions.get(extension)
+        if not ext:
+            raise ValueError(f"Extension {extension} not found.")
+        # Check if the command exists in the extension object
+        if not hasattr(ext, method):
+            raise ValueError(f"Command {method} not found in extension {extension}.")
+
+        # Access the method
+        _method = getattr(ext, method)
+
+        # Check if it is a coroutine
+        if asyncio.iscoroutinefunction(_method):
+            result = await _method(**kwargs)
+        else:
+            result = _method(**kwargs)
+        return result

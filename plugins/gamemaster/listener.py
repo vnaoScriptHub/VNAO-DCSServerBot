@@ -1,16 +1,22 @@
 from __future__ import annotations
+import asyncio
 import discord
 import logging
 import os
 import psycopg
-from contextlib import closing
-from core import EventListener, Side, Coalition, Channel, utils, event, chat_command
+
+from functools import partial
+from psycopg.rows import dict_row
+
+from core import EventListener, Side, Coalition, Channel, utils, event, chat_command, CloudRotatingFileHandler, \
+    get_translation, ChatCommand
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from core import Player, Server, Plugin
+
+_ = get_translation(__name__.split('.')[1])
 
 
 class GameMasterEventListener(EventListener):
@@ -18,20 +24,30 @@ class GameMasterEventListener(EventListener):
     def __init__(self, plugin: Plugin):
         super().__init__(plugin)
         self.chat_log = dict()
+        self.tasks: dict[str, asyncio.TimerHandle] = {}
+
+    async def can_run(self, command: ChatCommand, server: Server, player: Player) -> bool:
+        coalition = await self.get_coalition(server, player)
+        if coalition and command.name in ['join', 'red', 'blue']:
+            return False
+        elif not coalition and command.name in ['leave', 'password', 'coalition']:
+            return False
+        return await super().can_run(command, server, player)
 
     @event(name="registerDCSServer")
-    async def registerDCSServer(self, server: Server, data: dict) -> None:
+    async def registerDCSServer(self, server: Server, _: dict) -> None:
         if not server.locals.get('chat_log') or server.name in self.chat_log:
             return
         os.makedirs('logs', exist_ok=True)
         self.chat_log[server.name] = logging.getLogger(name=f'chat-{server.name}')
+        self.chat_log[server.name].propagate = False
         self.chat_log[server.name].setLevel(logging.INFO)
         formatter = logging.Formatter(fmt=u'%(asctime)s.%(msecs)03d %(levelname)s\t%(message)s',
                                       datefmt='%Y-%m-%d %H:%M:%S')
         filename = os.path.join('logs', f'{utils.slugify(server.name)}-chat.log')
-        fh = RotatingFileHandler(filename, encoding='utf-8',
-                                 maxBytes=int(server.locals['chat_log'].get('size', 1048576)),
-                                 backupCount=int(server.locals['chat_log'].get('count', 10)))
+        fh = CloudRotatingFileHandler(filename, encoding='utf-8',
+                                      maxBytes=int(server.locals['chat_log'].get('size', 1048576)),
+                                      backupCount=int(server.locals['chat_log'].get('count', 10)))
         fh.setLevel(logging.INFO)
         fh.setFormatter(formatter)
         self.chat_log[server.name].addHandler(fh)
@@ -53,184 +69,223 @@ class GameMasterEventListener(EventListener):
             if not server.locals.get('no_coalition_chat', False) or data['to'] != -2:
                 chat_channel = self.bot.get_channel(server.channels[Channel.CHAT])
         if chat_channel:
-            await chat_channel.send(f"{player.name} said: {data['message']}")
+            # noinspection PyAsyncCall
+            asyncio.create_task(chat_channel.send(f"{player.name} said: {data['message']}"))
 
-    def get_coalition(self, server: Server, player: Player) -> Optional[Coalition]:
+    async def get_coalition(self, server: Server, player: Player) -> Optional[Coalition]:
         if not player.coalition:
-            with self.pool.connection() as conn:
-                with closing(conn.cursor()) as cursor:
-                    cursor.execute("""
-                        SELECT coalition FROM coalitions 
-                        WHERE server_name = %s and player_ucid = %s AND coalition_leave IS NULL
-                    """, (server.name, player.ucid))
-                    coalition = cursor.fetchone()[0] if cursor.rowcount == 1 else None
-                    if coalition:
-                        player.coalition = Coalition(coalition)
+            async with self.apool.connection() as conn:
+                cursor = await conn.execute("""
+                    SELECT coalition FROM coalitions 
+                    WHERE server_name = %s and player_ucid = %s AND coalition_leave IS NULL
+                """, (server.name, player.ucid))
+                coalition = (await cursor.fetchone())[0] if cursor.rowcount == 1 else None
+                if coalition:
+                    player.coalition = Coalition(coalition)
         return player.coalition
 
-    def get_coalition_password(self, server: Server, coalition: Coalition) -> Optional[str]:
-        with self.pool.connection() as conn:
-            with closing(conn.cursor()) as cursor:
-                row = cursor.execute('SELECT blue_password, red_password FROM servers WHERE server_name = %s',
-                                     (server.name,)).fetchone()
-                return row[0] if coalition == Coalition.BLUE else row[1]
+    async def get_coalition_password(self, server: Server, coalition: Coalition) -> Optional[str]:
+        async with self.apool.connection() as conn:
+            cursor = await conn.execute('SELECT blue_password, red_password FROM servers WHERE server_name = %s',
+                                        (server.name,))
+            row = await cursor.fetchone()
+            return row[0] if coalition == Coalition.BLUE else row[1]
+
+    async def send_player_message(self, player: Player):
+        async with (self.apool.connection() as conn):
+            async with conn.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute("SELECT * FROM messages WHERE player_ucid = %s ORDER BY id",
+                                     (player.ucid, ))
+                message = ""
+                ack = False
+                async for row in cursor:
+                    ack = ack or row['ack']
+                    if message:
+                        message += '\n---\n'
+                    message += utils.format_string(row['message'], player=player, server=player.server)
+                if message:
+                    if ack:
+                        message += _("\n\nYou need to send {}ack in the in-game chat to acknowledge.\n"
+                                     "If you do not do that in-between 30s, you'll get booted from this slot.").format(
+                            self.prefix)
+                        self.tasks[player.ucid] = self.loop.call_later(30, self.boot_player, player)
+                    await player.sendUserMessage(message, timeout=30)
+                    async with conn.transaction():
+                        await conn.execute("DELETE FROM messages WHERE player_ucid = %s AND ack IS FALSE",
+                                           (player.ucid, ))
+
+    def boot_player(self, player: Player):
+        task = self.tasks.pop(player.ucid, None)
+        if not task or task.cancelled():
+            return
+        asyncio.create_task(player.server.move_to_spectators(player, reason="You need to acknowledge the message."))
 
     @event(name="onPlayerStart")
     async def onPlayerStart(self, server: Server, data: dict) -> None:
-        if data['id'] != 1 and server.locals.get('coalitions'):
-            player: Player = server.get_player(id=data['id'])
-            if player.has_discord_roles(['DCS Admin', 'GameMaster']):
-                side = Side.UNKNOWN
-            elif player.coalition == Coalition.BLUE:
-                side = Side.BLUE
-            elif player.coalition == Coalition.RED:
-                side = Side.RED
-            else:
-                side = Side.SPECTATOR
-            server.send_to_dcs({
-                "command": "setUserCoalition",
-                "ucid": player.ucid,
-                "coalition": side.value
-            })
-            await self._coalition(server, player)
-            if self.get_coalition_password(server, player.coalition):
-                await self._password(server, player)
+        if data['id'] == 1 or not server.locals.get('coalitions') or 'ucid' not in data:
+            return
+        player: Player = server.get_player(ucid=data['ucid'])
+        if not player:
+            return
 
-    def campaign(self, command: str, *, servers: Optional[list[Server]] = None, name: Optional[str] = None,
-                 description: Optional[str] = None, start: Optional[datetime] = None, end: Optional[datetime] = None):
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                with closing(conn.cursor()) as cursor:
-                    if command == 'add':
-                        cursor.execute('INSERT INTO campaigns (name, description, start, stop) VALUES (%s, %s, %s, %s)',
+        if player.has_discord_roles(['DCS Admin', 'GameMaster']):
+            side = Side.UNKNOWN
+        elif player.coalition == Coalition.BLUE:
+            side = Side.BLUE
+        elif player.coalition == Coalition.RED:
+            side = Side.RED
+        else:
+            side = Side.SPECTATOR
+        # noinspection PyAsyncCall
+        asyncio.create_task(server.send_to_dcs({
+            "command": "setUserCoalition",
+            "ucid": player.ucid,
+            "coalition": side.value
+        }))
+        # noinspection PyAsyncCall
+        asyncio.create_task(self._coalition(server, player))
+        if await self.get_coalition_password(server, player.coalition):
+            # noinspection PyAsyncCall
+            asyncio.create_task(self._password(server, player))
+
+    @event(name="onMissionEvent")
+    async def onMissionEvent(self, server: Server, data: dict) -> None:
+        if data['eventName'] == 'S_EVENT_BIRTH' and 'name' in data['initiator']:
+            player: Player = server.get_player(name=data['initiator']['name'], active=True)
+            if not player:
+                # should never happen, just in case
+                return
+            # check for player messages and start to annoy them
+            # noinspection PyAsyncCall
+            asyncio.create_task(self.send_player_message(player))
+
+    async def campaign(self, command: str, *, servers: Optional[list[Server]] = None, name: Optional[str] = None,
+                       description: Optional[str] = None, start: Optional[datetime] = None,
+                       end: Optional[datetime] = None):
+        async with self.apool.connection() as conn:
+            async with conn.transaction():
+                if command == 'add':
+                    await conn.execute('INSERT INTO campaigns (name, description, start, stop) VALUES (%s, %s, %s, %s)',
                                        (name, description, start, end))
-                        if servers:
-                            cursor.execute('SELECT id FROM campaigns WHERE name ILIKE %s', (name,))
-                            campaign_id = cursor.fetchone()[0]
-                            for server in servers:
-                                # add this server to the server list
-                                cursor.execute('INSERT INTO campaigns_servers VALUES (%s, %s) ON CONFLICT DO NOTHING',
+                    if servers:
+                        cursor = await conn.execute('SELECT id FROM campaigns WHERE name ILIKE %s', (name,))
+                        campaign_id = (await cursor.fetchone())[0]
+                        for server in servers:
+                            # add this server to the server list
+                            await conn.execute('INSERT INTO campaigns_servers VALUES (%s, %s) ON CONFLICT DO NOTHING',
                                                (campaign_id, server.name))
-                    elif command == 'start':
-                        cursor.execute("""
+                elif command == 'start':
+                    cursor = await conn.execute("""
+                        SELECT id FROM campaigns WHERE name ILIKE %s 
+                        AND (now() AT TIME ZONE 'utc') BETWEEN start 
+                        AND COALESCE(stop, (now() AT TIME ZONE 'utc'))
+                    """, (name,))
+                    if cursor.rowcount == 0:
+                        await conn.execute('INSERT INTO campaigns (name) VALUES (%s)', (name,))
+                    if servers:
+                        cursor = await conn.execute("""
                             SELECT id FROM campaigns WHERE name ILIKE %s 
                             AND (now() AT TIME ZONE 'utc') BETWEEN start 
                             AND COALESCE(stop, (now() AT TIME ZONE 'utc'))
                         """, (name,))
-                        if cursor.rowcount == 0:
-                            cursor.execute('INSERT INTO campaigns (name) VALUES (%s)', (name,))
-                        if servers:
-                            cursor.execute("""
-                                SELECT id FROM campaigns WHERE name ILIKE %s 
-                                AND (now() AT TIME ZONE 'utc') BETWEEN start 
-                                AND COALESCE(stop, (now() AT TIME ZONE 'utc'))
-                            """, (name,))
-                            # don't use currval() in here, as we can't rely on the sequence name
-                            campaign_id = cursor.fetchone()[0]
-                            for server in servers:
-                                cursor.execute("INSERT INTO campaigns_servers VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                        # don't use currval() in here, as we can't rely on the sequence name
+                        campaign_id = (await cursor.fetchone())[0]
+                        for server in servers:
+                            await conn.execute("INSERT INTO campaigns_servers VALUES (%s, %s) ON CONFLICT DO NOTHING",
                                                (campaign_id, server.name,))
-                    elif command == 'stop':
-                        cursor.execute("""
-                            UPDATE campaigns SET stop = (now() AT TIME ZONE 'utc') WHERE name ILIKE %s 
-                            AND (now() AT TIME ZONE 'utc') BETWEEN start 
-                            AND COALESCE(stop, (now() AT TIME ZONE 'utc') )
-                        """, (name,))
-                    elif command == 'delete':
-                        cursor.execute('SELECT id FROM campaigns WHERE name ILIKE %s', (name,))
-                        campaign_id = cursor.fetchone()[0]
-                        cursor.execute('DELETE FROM campaigns_servers WHERE campaign_id = %s', (campaign_id,))
-                        cursor.execute('DELETE FROM campaigns WHERE id = %s', (campaign_id,))
+                elif command == 'stop':
+                    await conn.execute("""
+                        UPDATE campaigns SET stop = (now() AT TIME ZONE 'utc') WHERE name ILIKE %s 
+                        AND (now() AT TIME ZONE 'utc') BETWEEN start 
+                        AND COALESCE(stop, (now() AT TIME ZONE 'utc') )
+                    """, (name,))
+                elif command == 'delete':
+                    cursor = await conn.execute('SELECT id FROM campaigns WHERE name ILIKE %s', (name,))
+                    campaign_id = (await cursor.fetchone())[0]
+                    await conn.execute('DELETE FROM campaigns_servers WHERE campaign_id = %s', (campaign_id,))
+                    await conn.execute('DELETE FROM campaigns WHERE id = %s', (campaign_id,))
 
     @event(name="startCampaign")
     async def startCampaign(self, server: Server, data: dict) -> None:
         name = data['name'] or '_internal_'
         try:
-            self.campaign('start', servers=[server], name=name)
+            # noinspection PyAsyncCall
+            asyncio.create_task(self.campaign('start', servers=[server], name=name))
         except psycopg.errors.UniqueViolation:
-            await self.resetCampaign(data)
+            # noinspection PyAsyncCall
+            asyncio.create_task(self._resetCampaign(server))
 
     @event(name="stopCampaign")
-    async def stopCampaign(self, server: Server, data: dict) -> None:
+    async def stopCampaign(self, server: Server, _: dict) -> None:
         _, name = utils.get_running_campaign(self.bot, server)
         if name:
-            self.campaign('delete', name=name)
+            # noinspection PyAsyncCall
+            asyncio.create_task(self.campaign('delete', name=name))
 
-    @event(name="resetCampaign")
-    async def resetCampaign(self, server: Server, data: dict) -> None:
+    async def _resetCampaign(self, server: Server) -> None:
         _, name = utils.get_running_campaign(self.bot, server)
         if name:
-            self.campaign('delete', name=name)
+            await self.campaign('delete', name=name)
         else:
             name = '_internal_'
-        self.campaign('start', servers=[server], name=name)
+        await self.campaign('start', servers=[server], name=name)
+
+    @event(name="resetCampaign")
+    async def resetCampaign(self, server: Server, _: dict) -> None:
+        # noinspection PyAsyncCall
+        asyncio.create_task(self._resetCampaign(server))
 
     async def _join(self, server: Server, player: Player, params: list[str]):
-        if not server.locals.get('coalitions'):
-            player.sendChatMessage("Coalitions are not enabled on this server.")
-            return
         coalition = params[0] if params else ''
         if coalition.casefold() not in ['blue', 'red']:
-            player.sendChatMessage(f"Usage: {self.prefix}join <blue|red>")
+            await player.sendChatMessage(_("Usage: {}join <blue|red>").format(self.prefix))
             return
         if player.coalition:
-            if player.coalition == Coalition(coalition):
-                player.sendChatMessage(f"You are a member of coalition {coalition} already.")
-            else:
-                if player.coalition == Coalition.RED:
-                    player.sendChatMessage(f"You are a member of coalition red already.")
-                else:
-                    player.sendChatMessage(f"You are a member of coalition blue already.")
+            await player.sendChatMessage(_("You are a member of coalition {} already.").format(coalition))
             return
-
         # update the database
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                with closing(conn.cursor()) as cursor:
-                    # check if the player is eligible to change the coalitions
-                    lock_time = server.locals['coalitions'].get('lock_time', '1 day')
-                    cursor.execute(f"""
-                        SELECT coalition FROM coalitions 
-                        WHERE server_name = %s AND player_ucid = %s 
-                        AND coalition_leave > ((now() AT TIME ZONE 'utc') - interval '{lock_time}')
-                    """, (server.name, player.ucid))
-                    if cursor.rowcount == 1:
-                        if cursor.fetchone()[0] != coalition.casefold():
-                            player.sendChatMessage(f"You can't join the {coalition} coalition in-between "
-                                                   f"{server.locals['coalitions'].get('lock_time', '1 day')} of "
-                                                   f"leaving a coalition.")
-                            await self.bot.audit(
-                                f"{player.display_name} tried to join a new coalition in-between the time limit.",
-                                user=player.ucid)
-                            return
+        async with self.apool.connection() as conn:
+            async with conn.transaction():
+                # check if the player is eligible to change the coalitions
+                lock_time = server.locals['coalitions'].get('lock_time', '1 day')
+                cursor = await conn.execute(f"""
+                    SELECT coalition FROM coalitions 
+                    WHERE server_name = %s AND player_ucid = %s 
+                    AND coalition_leave > ((now() AT TIME ZONE 'utc') - interval '{lock_time}')
+                """, (server.name, player.ucid))
+                if cursor.rowcount == 1:
+                    if (await cursor.fetchone())[0] != coalition.casefold():
+                        await player.sendChatMessage(_("You can't join the {coalition} coalition in-between {lock_time} of "
+                                                       "leaving a coalition.").format(
+                            coalition=coalition, lock_time=server.locals['coalitions'].get('lock_time', '1 day')))
+                        await self.bot.audit(
+                            f"{player.display_name} tried to join a new coalition in-between the time limit.",
+                            user=player.ucid)
+                        return
 
-                    # set the new coalition
-                    cursor.execute("""
-                        INSERT INTO coalitions (server_name, player_ucid, coalition, coalition_leave) 
-                        VALUES (%s, %s, %s, NULL) 
-                        ON CONFLICT (server_name, player_ucid) DO UPDATE 
-                        SET coalition = excluded.coalition, coalition_leave = excluded.coalition_leave
-                    """, (server.name, player.ucid, coalition))
-                    player.coalition = Coalition(coalition)
+                # set the new coalition
+                await conn.execute("""
+                    INSERT INTO coalitions (server_name, player_ucid, coalition, coalition_leave) 
+                    VALUES (%s, %s, %s, NULL) 
+                    ON CONFLICT (server_name, player_ucid) DO UPDATE 
+                    SET coalition = excluded.coalition, coalition_leave = excluded.coalition_leave
+                """, (server.name, player.ucid, coalition))
+                player.coalition = Coalition(coalition)
 
         # welcome them in DCS
-        password = self.get_coalition_password(server, player.coalition)
-        player.sendChatMessage(f'Welcome to the {coalition} side!')
+        password = await self.get_coalition_password(server, player.coalition)
+        await player.sendChatMessage(_('Welcome to the {} side!').format(coalition))
         if password:
-            player.sendChatMessage(f"Your coalition password is {password}.")
+            await player.sendChatMessage(_("Your coalition password is {}").format(password))
 
         # set the discord role
-        try:
-            if player.member:
-                roles = {
-                    Coalition.RED: self.bot.get_role(server.locals['coalitions']['red_role']),
-                    Coalition.BLUE: self.bot.get_role(server.locals['coalitions']['blue_role'])
-                }
-                role = roles[player.coalition]
-                if role:
-                    await player.member.add_roles(role)
-        except discord.Forbidden:
-            await self.bot.audit(f'permission "Manage Roles" missing.', user=self.bot.member)
+        if player.member:
+            roles = {
+                Coalition.RED: server.locals['coalitions']['red_role'],
+                Coalition.BLUE: server.locals['coalitions']['blue_role']
+            }
+            # noinspection PyAsyncCall
+            asyncio.create_task(player.add_role(roles[player.coalition]))
 
     async def reset_coalitions(self, server: Server, discord_roles: bool):
         guild = self.bot.guilds[0]
@@ -238,26 +293,25 @@ class GameMasterEventListener(EventListener):
             "red": self.bot.get_role(server.locals['coalitions']['red_role']),
             "blue": self.bot.get_role(server.locals['coalitions']['blue_role'])
         }
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                with closing(conn.cursor()) as cursor:
-                    for row in cursor.execute("""
-                        SELECT p.ucid, p.discord_id, c.coalition 
-                        FROM players p, coalitions c 
-                        WHERE p.ucid = c.player_ucid AND c.server_name = %s AND c.coalition IS NOT NULL
-                    """, (server.name,)):
-                        if discord_roles and row[1] != -1:
-                            member = guild.get_member(row[1])
-                            if member:
-                                try:
-                                    await member.remove_roles(roles[row[2]])
-                                except discord.Forbidden:
-                                    await self.bot.audit(f'permission "Manage Roles" missing.',
-                                                         user=self.bot.member)
-                                    raise
-                        cursor.execute('DELETE FROM coalitions WHERE server_name = %s AND player_ucid = %s',
-                                       (server.name, row[0]))
-                    server.send_to_dcs({"command": "resetUserCoalitions"})
+        async with self.apool.connection() as conn:
+            async with conn.transaction():
+                cursor = await conn.execute("""
+                    SELECT p.ucid, p.discord_id, c.coalition 
+                    FROM players p, coalitions c 
+                    WHERE p.ucid = c.player_ucid AND c.server_name = %s AND c.coalition IS NOT NULL
+                """, (server.name,))
+                rows = await cursor.fetchall()
+                for row in rows:
+                    if discord_roles and row[1] != -1:
+                        member = guild.get_member(row[1])
+                        if member:
+                            try:
+                                await member.remove_roles(roles[row[2]])
+                            except discord.Forbidden:
+                                await self.bot.audit('permission "Manage Roles" missing.', user=self.bot.member)
+                    await cursor.execute('DELETE FROM coalitions WHERE server_name = %s AND player_ucid = %s',
+                                         (server.name, row[0]))
+        await server.send_to_dcs({"command": "resetUserCoalitions"})
 
     @event(name="resetUserCoalitions")
     async def resetUserCoalitions(self, server: Server, data: dict) -> None:
@@ -266,96 +320,102 @@ class GameMasterEventListener(EventListener):
                 f'Event "resetUserCoalitions" received, but COALITIONS are disabled on server "{server.name}"')
             return
         discord_roles = data.get('discord_roles', False)
-        try:
-            await self.reset_coalitions(server, discord_roles)
-        except discord.Forbidden:
-            self.log.error('The bot is missing the "Manage Roles" permission.')
+        # noinspection PyAsyncCall
+        asyncio.create_task(self.reset_coalitions(server, discord_roles))
 
-    @chat_command(name="join", usage="<coalition>", help="join a coalition")
+    @chat_command(name="join", usage="<red|blue>", help=_("join a coalition"))
     async def join(self, server: Server, player: Player, params: list[str]):
         await self._join(server, player, params)
 
-    @chat_command(name="leave", help="leave your coalition")
+    @chat_command(name="leave", help=_("leave your coalition"))
     async def leave(self, server: Server, player: Player, params: list[str]):
-        if not self.get_coalition(server, player):
-            player.sendChatMessage(f"You are not a member of any coalition. You can join one with "
-                                   f"{self.prefix}join blue|red.")
+        if not await self.get_coalition(server, player):
+            await player.sendChatMessage(
+                _("You are not a member of any coalition. You can join one with {}join blue|red.").format(self.prefix))
             return
         # update the database
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                conn.execute("""
+        async with self.apool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute("""
                     UPDATE coalitions SET coalition_leave = (now() AT TIME ZONE 'utc') 
                     WHERE server_name = %s AND player_ucid = %s
                 """, (server.name, player.ucid))
-                player.sendChatMessage(f"You've left the {player.coalition.name} coalition!")
+                await player.sendChatMessage(_("You left the {} coalition!").format(player.coalition.name))
         # remove discord roles
-        try:
-            if player.member:
-                roles = {
-                    Coalition.RED: self.bot.get_role(server.locals['coalitions']['red_role']),
-                    Coalition.BLUE: self.bot.get_role(server.locals['coalitions']['blue_role'])
-                }
-                await player.member.remove_roles(roles[player.coalition])
-        except discord.Forbidden:
-            await self.bot.audit(f'Permission "Manage Roles" missing for {self.bot.member.name}.', user=self.bot.member)
-        finally:
-            player.coalition = None
+        if player.member:
+            roles = {
+                Coalition.RED: server.locals['coalitions']['red_role'],
+                Coalition.BLUE: server.locals['coalitions']['blue_role']
+            }
+            # noinspection PyAsyncCall
+            asyncio.create_task(player.remove_role(roles[player.coalition]))
+        player.coalition = None
 
-    @chat_command(name="red", help="join the red side")
-    async def red(self, server: Server, player: Player, params: list[str]):
+    @chat_command(name="red", help=_("join the red side"))
+    async def red(self, server: Server, player: Player, _: list[str]):
         await self._join(server, player, ["red"])
 
-    @chat_command(name="blue", help="join the blue side")
+    @chat_command(name="blue", help=_("join the blue side"))
     async def blue(self, server: Server, player: Player, params: list[str]):
         await self._join(server, player, ["blue"])
 
     async def _coalition(self, server: Server, player: Player):
-        coalition = self.get_coalition(server, player)
+        coalition = await self.get_coalition(server, player)
         if coalition:
-            player.sendChatMessage(f"You are a member of the {coalition.name} coalition.")
+            await player.sendChatMessage(_("You are a member of the {} coalition."))
         else:
-            player.sendChatMessage(f"You are not a member of any coalition. You can join one with "
-                                   f"{self.prefix}join blue|red.")
+            await player.sendChatMessage(
+                _("You are not a member of any coalition. You can join one with {}join blue|red.").format(self.prefix))
 
-    @chat_command(name="coalition", help="displays your current coalition")
+    @chat_command(name="coalition", help=_("displays your current coalition"))
     async def coalition(self, server: Server, player: Player, params: list[str]):
-        if not server.locals.get('coalitions'):
-            player.sendChatMessage("Coalitions are not enabled on this server.")
-        await self._coalition(server, player)
+        # noinspection PyAsyncCall
+        asyncio.create_task(self._coalition(server, player))
 
     async def _password(self, server: Server, player: Player):
-        coalition = self.get_coalition(server, player)
+        coalition = await self.get_coalition(server, player)
         if not coalition:
-            player.sendChatMessage(f"You are not a member of any coalition. You can join one with "
-                                   f"{self.prefix}join blue|red.")
+            await player.sendChatMessage(
+                _("You are not a member of any coalition. You can join one with {}join blue|red.").format(self.prefix))
             return
-        password = self.get_coalition_password(server, player.coalition)
+        password = await self.get_coalition_password(server, player.coalition)
         if password:
-            player.sendChatMessage(f"Your coalition password is {password}.")
+            await player.sendChatMessage(_("Your coalition password is {}").format(password))
         else:
-            player.sendChatMessage("There is no password set for your coalition.")
+            await player.sendChatMessage(_("There is no password set for your coalition."))
 
-    @chat_command(name="password", aliases=["passwd"], help="displays the coalition password")
+    @chat_command(name="password", aliases=["passwd"], help=_("displays the coalition password"))
     async def password(self, server: Server, player: Player, params: list[str]):
-        if not server.locals.get('coalitions'):
-            player.sendChatMessage("Coalitions are not enabled on this server.")
-        await self._password(server, player)
+        # noinspection PyAsyncCall
+        asyncio.create_task(self._password(server, player))
 
-    @chat_command(name="flag", roles=['DCS Admin', 'GameMaster'], usage="<flag> [value]", help="reads or sets a flag")
+    @chat_command(name="flag", roles=['DCS Admin', 'GameMaster'], usage=_("<flag> [value]"),
+                  help=_("reads or sets a flag"))
     async def flag(self, server: Server, player: Player, params: list[str]):
         if not params:
-            player.sendChatMessage(f"Usage: {self.prefix}flag <flag> [value]")
+            await player.sendChatMessage(_("Usage: {}flag <flag> [value]").format(self.prefix))
             return
         flag = params[0]
         if len(params) > 1:
             value = int(params[1])
-            server.send_to_dcs({
+            await server.send_to_dcs({
                 "command": "setFlag",
                 "flag": flag,
                 "value": value
             })
-            player.sendChatMessage(f"Flag {flag} set to {value}.")
+            await player.sendChatMessage(f"Flag {flag} set to {value}.")
         else:
             response = await server.send_to_dcs_sync({"command": "getFlag", "flag": flag})
-            player.sendChatMessage(f"Flag {flag} has value {response['value']}.")
+            await player.sendChatMessage(_("Flag {flag} has value {value}.").format(flag=flag, value=response['value']))
+
+    @chat_command(name="ack", help=_("acknowledge a user message"))
+    async def ack(self, server: Server, player: Player, params: list[str]):
+        async with self.apool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute("""
+                    DELETE FROM messages m WHERE m.player_ucid = %s 
+                """, (player.ucid, ))
+        task = self.tasks.pop(player.ucid)
+        if task:
+            task.cancel()
+        await player.sendChatMessage(_("Message(s) acknowledged."))
