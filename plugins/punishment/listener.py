@@ -1,6 +1,6 @@
 import asyncio
 
-from core import EventListener, Plugin, Server, Player, Status, event, chat_command, utils, get_translation, ChatCommand
+from core import EventListener, Plugin, Server, Player, Status, event, chat_command, get_translation, ChatCommand
 from plugins.competitive.commands import Competitive
 from typing import Optional
 
@@ -22,7 +22,9 @@ class PunishmentEventListener(EventListener):
             self.log.exception(ex)
 
     async def can_run(self, command: ChatCommand, server: Server, player: Player) -> bool:
-        if command.name == 'forgive':
+        if server.name not in self.active_servers:
+            return False
+        elif command.name == 'forgive':
             return self.plugin.get_config(server).get('forgive') is not None
         return await super().can_run(command, server, player)
 
@@ -30,6 +32,8 @@ class PunishmentEventListener(EventListener):
     async def registerDCSServer(self, server: Server, _: dict) -> None:
         if self.get_config(server).get('enabled', True):
             self.active_servers.add(server.name)
+        else:
+            self.active_servers.discard(server.name)
 
     @event(name="onMissionLoadEnd")
     async def onMissionLoadEnd(self, server: Server, _: dict) -> None:
@@ -113,7 +117,7 @@ class PunishmentEventListener(EventListener):
             competitive: Optional[Competitive] = self.bot.cogs.get('Competitive')
             if competitive:
                 player: Player = server.get_player(id=data['arg1'])
-                if not player or competitive.eventlistener.in_match[server.name].get(player.ucid):
+                if not player or competitive.eventlistener.in_match.get(server.name, {}).get(player.ucid):
                     return
         if self.plugin.get_config(server) and server.status == Status.RUNNING:
             if data['eventName'] == 'friendly_fire':

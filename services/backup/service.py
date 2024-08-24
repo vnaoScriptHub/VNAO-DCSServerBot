@@ -1,10 +1,8 @@
 import asyncio
-import glob
 import os
 import shlex
 import subprocess
 import time
-import sys
 
 from core import ServiceRegistry, Service, utils
 from datetime import datetime
@@ -18,7 +16,7 @@ __all__ = ["BackupService"]
 @ServiceRegistry.register(plugin="backup")
 class BackupService(Service):
     def __init__(self, node):
-        from services import ServiceBus
+        from services.servicebus import ServiceBus
 
         super().__init__(node=node, name="Backup")
         if not self.locals:
@@ -31,7 +29,7 @@ class BackupService(Service):
     def _secure_password(self):
         config = self.locals['backups'].get('database')
         if config and config.get("password"):
-            utils.set_password("postgres", config["password"])
+            utils.set_password("postgres", config["password"], self.node.config_dir)
             del config['password']
             return True
         return False
@@ -114,7 +112,7 @@ class BackupService(Service):
         database = urlparse(url).path.strip('/')
         args = shlex.split(f'--no-owner --no-privileges -U postgres -F t -f "{path}" -d "{database}"')
         try:
-            os.environ['PGPASSWORD'] = utils.get_password('postgres')
+            os.environ['PGPASSWORD'] = utils.get_password('postgres', self.node.config_dir)
         except ValueError:
             self.log.error("Backup of database failed. No password set.")
             return False
@@ -130,10 +128,11 @@ class BackupService(Service):
             return False
 
     def recover_database(self, date: str):
-        target = os.path.expandvars(self.locals.get('target'))
-        path = os.path.join(target, f"{self.node.name.lower()}_{date}", f"db_{date}_*.tar")
-        filename = glob.glob(path)[0]
-        os.execv(sys.executable, [os.path.basename(sys.executable), 'recover.py', '-f', filename] + sys.argv[1:])
+        ...
+#        target = os.path.expandvars(self.locals.get('target'))
+#        path = os.path.join(target, f"{self.node.name.lower()}_{date}", f"db_{date}_*.tar")
+#        filename = glob.glob(path)[0]
+#        os.execv(sys.executable, [os.path.basename(sys.executable), 'recover.py', '-f', filename] + sys.argv[1:])
 
     def recover_bot(self, filename: str):
         ...

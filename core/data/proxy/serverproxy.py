@@ -2,8 +2,7 @@ from __future__ import annotations
 from core import Server, Status, utils, Coalition
 from core.data.node import UploadStatus
 from dataclasses import dataclass, field
-from typing import Optional, Union
-
+from typing import Optional, Union, Any
 
 __all__ = ["ServerProxy"]
 
@@ -41,7 +40,7 @@ class ServerProxy(Server):
 
     @settings.setter
     def settings(self, s: dict):
-        self._settings = utils.RemoteSettingsDict(self, "settings", s)
+        self._settings = utils.RemoteSettingsDict(self, "_settings", s)
 
     @property
     def options(self) -> dict:
@@ -49,7 +48,7 @@ class ServerProxy(Server):
 
     @options.setter
     def options(self, o: dict):
-        self._options = utils.RemoteSettingsDict(self, "options", o)
+        self._options = utils.RemoteSettingsDict(self, "_options", o)
 
     async def get_current_mission_file(self) -> Optional[str]:
         timeout = 60 if not self.node.slow_system else 120
@@ -120,14 +119,15 @@ class ServerProxy(Server):
             }, node=self.node.name, timeout=timeout)
             self.status = Status.SHUTDOWN
 
-    async def init_extensions(self):
+    async def init_extensions(self) -> list[str]:
         timeout = 180 if not self.node.slow_system else 300
-        await self.bus.send_to_node_sync({
+        data = await self.bus.send_to_node_sync({
             "command": "rpc",
             "object": "Server",
             "method": "init_extensions",
             "server_name": self.name
         }, node=self.node.name, timeout=timeout)
+        return data['return']
 
     async def prepare_extensions(self):
         timeout = 180 if not self.node.slow_system else 300
@@ -371,3 +371,41 @@ class ServerProxy(Server):
             "params": params
         }, timeout=timeout, node=self.node.name)
         return data['return']
+
+    async def config_extension(self, name: str, config: dict) -> None:
+        timeout = 60 if not self.node.slow_system else 120
+        await self.bus.send_to_node_sync({
+            "command": "rpc",
+            "object": "Server",
+            "method": "config_extension",
+            "server_name": self.name,
+            "params": {
+                "name": name,
+                "config": config
+            }
+        }, timeout=timeout, node=self.node.name)
+
+    async def install_extension(self, name: str, config: dict) -> None:
+        timeout = 180 if not self.node.slow_system else 300
+        await self.bus.send_to_node_sync({
+            "command": "rpc",
+            "object": "Server",
+            "method": "install_extension",
+            "server_name": self.name,
+            "params": {
+                "name": name,
+                "config": config
+            }
+        }, timeout=timeout, node=self.node.name)
+
+    async def uninstall_extension(self, name: str) -> None:
+        timeout = 180 if not self.node.slow_system else 300
+        await self.bus.send_to_node_sync({
+            "command": "rpc",
+            "object": "Server",
+            "method": "uninstall_extension",
+            "server_name": self.name,
+            "params": {
+                "name": name
+            }
+        }, timeout=timeout, node=self.node.name)

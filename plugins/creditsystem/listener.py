@@ -121,7 +121,9 @@ class CreditSystemListener(EventListener):
 
         campaign_id, _ = utils.get_running_campaign(self.bot, server)
         playtime = (await self.get_flighttime(player.ucid, campaign_id)) / 3600.0
-        sorted_achievements = sorted(config['achievements'], key=lambda x: x['credits'], reverse=True)
+        sorted_achievements = sorted(config['achievements'],
+                                     key=lambda x: x['credits'] if 'credits' in x else x['playtime'],
+                                     reverse=True)
         given = False
         for achievement in sorted_achievements:
             if given:
@@ -169,6 +171,14 @@ class CreditSystemListener(EventListener):
             if player:
                 # noinspection PyAsyncCall
                 asyncio.create_task(self.process_achievements(server, player))
+
+    @event(name="onCampaignReset")
+    async def onCampaignReset(self, server: Server, data: dict) -> None:
+        if server.status != Status.RUNNING:
+            return
+        config = self.plugin.get_config(server)
+        for player in server.get_active_players():  # type: CreditPlayer
+            player.points = self.get_initial_points(player, config)
 
     @chat_command(name="credits", help=_("Shows your current credits"))
     async def credits(self, server: Server, player: CreditPlayer, params: list[str]):

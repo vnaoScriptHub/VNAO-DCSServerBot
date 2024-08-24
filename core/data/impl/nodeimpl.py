@@ -1,7 +1,6 @@
 import aiofiles
 import aiohttp
 import asyncio
-import atexit
 import certifi
 import discord
 import glob
@@ -85,6 +84,7 @@ class NodeImpl(Node):
         self.bot_version = __version__[:__version__.rfind('.')]
         self.sub_version = int(__version__[__version__.rfind('.') + 1:])
         self.is_shutdown = asyncio.Event()
+        self.rc = 0
         self.dcs_branch = None
         self.dcs_version = None
         self.all_nodes: dict[str, Optional[Node]] = {self.name: self}
@@ -113,6 +113,9 @@ class NodeImpl(Node):
         self.apool: Optional[AsyncConnectionPool] = None
         self._master = None
         self.listen_address = self.locals.get('listen_address', '127.0.0.1')
+        if self.listen_address != '127.0.0.1':
+            self.log.warning(
+                'Please consider changing the listen_address in your nodes.yaml to 127.0.0.1 for security reasons!')
         self.listen_port = self.locals.get('listen_port', 10042)
 
     async def __aenter__(self):
@@ -150,26 +153,24 @@ class NodeImpl(Node):
     def installation(self) -> str:
         return os.path.expandvars(self.locals['DCS']['installation'])
 
-    @property
-    def extensions(self) -> dict:
-        return self.locals.get('extensions', {})
-
     async def audit(self, message, *, user: Optional[Union[discord.Member, str]] = None,
-                    server: Optional[Server] = None):
-        from services import BotService, ServiceBus
+                    server: Optional[Server] = None, **kwargs):
+        from services.bot import BotService
+        from services.servicebus import ServiceBus
 
         if self.master:
-            await ServiceRegistry.get(BotService).bot.audit(message, user=user, server=server)
+            await ServiceRegistry.get(BotService).bot.audit(message, user=user, server=server, **kwargs)
         else:
+            params = {
+                "message": message,
+                "user": f"<@{user.id}>" if isinstance(user, discord.Member) else user,
+                "server": server.name if server else ""
+            } | kwargs
             await ServiceRegistry.get(ServiceBus).send_to_node({
                 "command": "rpc",
                 "service": BotService.__name__,
                 "method": "audit",
-                "params": {
-                    "message": message,
-                    "user": f"<@{user.id}>" if isinstance(user, discord.Member) else user,
-                    "server": server.name if server else ""
-                }
+                "params": params
             })
 
     def register_callback(self, what: str, name: str, func: Callable[[], Awaitable[Any]]):
@@ -184,23 +185,20 @@ class NodeImpl(Node):
         else:
             del self.after_update[name]
 
-    async def shutdown(self):
+    async def shutdown(self, rc: int = -2):
+        self.rc = rc
         self.is_shutdown.set()
 
     async def restart(self):
-        def _restart():
-            self.log.info("Restarting ...")
-            os.execv(sys.executable, [os.path.basename(sys.executable), 'run.py'] + sys.argv[1:])
-        atexit.register(_restart)
-        await self.shutdown()
+        await self.shutdown(-1)
 
     def read_locals(self) -> dict:
         _locals = dict()
         config_file = os.path.join(self.config_dir, 'nodes.yaml')
         if os.path.exists(config_file):
             try:
-                schema_files = ['./schemas/nodes_schema.yaml']
-                schema_files.extend([str(x) for x in Path('./extensions/schemas').glob('*.yaml')])
+                schema_files = ['schemas/nodes_schema.yaml']
+                schema_files.extend([str(x) for x in Path('./extensions').rglob('*_schema.yaml')])
                 c = Core(source_file=config_file, schema_files=schema_files, file_encoding='utf-8')
                 try:
                     c.validate(raise_exception=True)
@@ -221,7 +219,7 @@ class NodeImpl(Node):
             if database_url:
                 url = urlparse(database_url)
                 if url.password and url.password != 'SECRET':
-                    utils.set_password('database', url.password)
+                    utils.set_password('database', url.password, self.config_dir)
                     port = url.port or 5432
                     node['database']['url'] = \
                         f"{url.scheme}://{url.username}:SECRET@{url.hostname}:{port}{url.path}?sslmode=prefer"
@@ -230,7 +228,7 @@ class NodeImpl(Node):
             password = node['DCS'].pop('dcs_password', node['DCS'].pop('password', None))
             if password:
                 node['DCS']['user'] = node['DCS'].pop('dcs_user', node['DCS'].get('user'))
-                utils.set_password('DCS', password)
+                utils.set_password('DCS', password, self.config_dir)
                 dirty = True
             if dirty:
                 with open(config_file, 'w', encoding='utf-8') as f:
@@ -241,7 +239,7 @@ class NodeImpl(Node):
     async def init_db(self) -> tuple[ConnectionPool, AsyncConnectionPool]:
         url = self.config.get("database", self.locals.get('database'))['url']
         try:
-            url = url.replace('SECRET', quote(utils.get_password('database')) or '')
+            url = url.replace('SECRET', quote(utils.get_password('database', self.config_dir)) or '')
         except ValueError:
             pass
         # quick connection check
@@ -289,7 +287,11 @@ class NodeImpl(Node):
         grouped = defaultdict(list)
         for server_name, instance_name in utils.findDCSInstances():
             grouped[server_name].append(instance_name)
-        duplicates = {server_name: instances for server_name, instances in grouped.items() if len(instances) > 1}
+        duplicates = {
+            server_name: instances
+            for server_name, instances in grouped.items()
+            if server_name != 'n/a' and len(instances) > 1
+        }
         for server_name, instances in duplicates.items():
             self.log.warning("Duplicate server \"{}\" defined in instance {}!".format(
                 server_name, ', '.join(instances)))
@@ -309,7 +311,7 @@ class NodeImpl(Node):
                 # initial setup
                 if len(tables) == 0:
                     self.log.info('Creating Database ...')
-                    with open('sql/tables.sql', mode='r') as tables_sql:
+                    with open(os.path.join('sql', 'tables.sql'), mode='r') as tables_sql:
                         for query in tables_sql.readlines():
                             self.log.debug(query.rstrip())
                             await cursor.execute(query.rstrip())
@@ -323,7 +325,7 @@ class NodeImpl(Node):
                     self.db_version = (await cursor.fetchone())[0]
                     while os.path.exists(f'sql/update_{self.db_version}.sql'):
                         old_version = self.db_version
-                        with open(f'sql/update_{self.db_version}.sql', mode='r') as tables_sql:
+                        with open(os.path.join('sql', f'update_{self.db_version}.sql'), mode='r') as tables_sql:
                             for query in tables_sql.readlines():
                                 self.log.debug(query.rstrip())
                                 await conn.execute(query.rstrip())
@@ -385,9 +387,10 @@ class NodeImpl(Node):
     async def upgrade_pending(self) -> bool:
         self.log.debug('- Checking for updates...')
         try:
-            rc = await self._upgrade_pending_git()
-        except ImportError:
-            rc = await self._upgrade_pending_non_git()
+            try:
+                rc = await self._upgrade_pending_git()
+            except ImportError:
+                rc = await self._upgrade_pending_non_git()
         except Exception as ex:
             self.log.exception(ex)
             raise
@@ -396,10 +399,6 @@ class NodeImpl(Node):
         return rc
 
     async def upgrade(self):
-        def _upgrade():
-            self.log.info("Starting the updater ...")
-            os.execv(sys.executable, [os.path.basename(sys.executable), 'update.py'] + sys.argv[1:])
-
         # We do not want to run an upgrade, if we are on a cloud drive, so just restart in this case
         if not self.master and self.locals.get('cloud_drive', True):
             await self.restart()
@@ -410,8 +409,7 @@ class NodeImpl(Node):
                     async with conn.transaction():
                         await conn.execute("UPDATE cluster SET update_pending = TRUE WHERE guild_id = %s",
                                            (self.guild_id, ))
-            atexit.register(_upgrade)
-            await self.shutdown()
+            await self.shutdown(-3)
 
     async def get_dcs_branch_and_version(self) -> tuple[str, str]:
         if not self.dcs_branch or not self.dcs_version:
@@ -425,7 +423,7 @@ class NodeImpl(Node):
         return self.dcs_branch, self.dcs_version
 
     async def update(self, warn_times: list[int], branch: Optional[str] = None) -> int:
-        from services import ServiceBus
+        from services.servicebus import ServiceBus
 
         async def shutdown_with_warning(server: Server):
             if server.is_populated():
@@ -459,21 +457,22 @@ class NodeImpl(Node):
                     process = subprocess.run(
                         cmd, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                     )
-                    if branch and process.returncode == 0:
-                        # check if the branch has been changed
-                        config = os.path.join(self.installation, 'autoupdate.cfg')
-                        with open(config, mode='r') as infile:
-                            data = json.load(infile)
-                        if data['branch'] != branch:
-                            data['branch'] = branch
-                            with open(config, mode='w') as outfile:
-                                json.dump(data, outfile, indent=2)
                     return process.returncode
                 except Exception as ex:
                     self.log.exception(ex)
                     return -1
 
-            return await asyncio.to_thread(run_subprocess)
+            rc = await asyncio.to_thread(run_subprocess)
+            if branch and rc == 0:
+                # check if the branch has been changed
+                config = os.path.join(self.installation, 'autoupdate.cfg')
+                with open(config, mode='r') as infile:
+                    data = json.load(infile)
+                if data['branch'] != branch:
+                    data['branch'] = branch
+                    with open(config, mode='w') as outfile:
+                        json.dump(data, outfile, indent=2)
+            return rc
 
         self.update_pending = True
         to_start = []
@@ -552,14 +551,14 @@ class NodeImpl(Node):
             "FALKLANDS_terrain",
             "SINAIMAP_terrain",
             "KOLA_terrain",
-            "Afghanistan_terrain",
+            "AFGHANISTAN_terrain",
             "WWII-ARMOUR",
             "SUPERCARRIER"
         }
         user = self.locals['DCS'].get('user')
         if not user:
             return list(licenses)
-        password = utils.get_password('DCS')
+        password = utils.get_password('DCS', self.config_dir)
         headers = {
             'User-Agent': 'DCS_Updater/'
         }
@@ -585,7 +584,7 @@ class NodeImpl(Node):
 
         async def _get_latest_version_auth():
             user = self.locals['DCS'].get('user')
-            password = utils.get_password('DCS')
+            password = utils.get_password('DCS', self.config_dir)
             headers = {
                 'User-Agent': 'DCS_Updater/'
             }
@@ -693,7 +692,7 @@ class NodeImpl(Node):
                                     await cursor.execute("UPDATE cluster SET version = %s WHERE guild_id = %s",
                                                          (__version__, self.guild_id))
                                 else:
-                                    from services import ServiceBus
+                                    from services.servicebus import ServiceBus
 
                                     # check all nodes
                                     for row in all_nodes:
@@ -852,7 +851,8 @@ class NodeImpl(Node):
         shutil.move(old_name, new_name, copy_function=shutil.copy2 if force else None)
 
     async def rename_server(self, server: Server, new_name: str):
-        from services import BotService, ServiceBus
+        from services.bot import BotService
+        from services.servicebus import ServiceBus
 
         if not self.master:
             self.log.error(
@@ -868,7 +868,8 @@ class NodeImpl(Node):
 
     @tasks.loop(minutes=5.0)
     async def autoupdate(self):
-        from services import BotService, ServiceBus
+        from services.bot import BotService
+        from services.servicebus import ServiceBus
 
         # don't run, if an update is currently running
         if self.update_pending:
@@ -884,7 +885,8 @@ class NodeImpl(Node):
                 self.log.info('A new version of DCS World is available. Auto-updating ...')
                 rc = await self.update([300, 120, 60])
                 if rc == 0:
-                    await ServiceRegistry.get(ServiceBus).send_to_node({
+                    bus = ServiceRegistry.get(ServiceBus)
+                    await bus.send_to_node({
                         "command": "rpc",
                         "service": BotService.__name__,
                         "method": "audit",
@@ -892,6 +894,34 @@ class NodeImpl(Node):
                             "message": f"DCS World updated to version {new_version} on node {self.node.name}."
                         }
                     })
+                    if isinstance(self.locals['DCS'].get('autoupdate'), dict):
+                        config = self.locals['DCS'].get('autoupdate')
+                        embed = discord.Embed(
+                            colour=discord.Colour.blue(),
+                            title=config.get(
+                                'title', 'DCS has been updated to version {}!').format(new_version),
+                            url=f"https://www.digitalcombatsimulator.com/en/news/changelog/stable/{new_version}/")
+                        embed.description = config.get('description', 'The following servers have been updated:')
+                        embed.set_thumbnail(url="https://forum.dcs.world/uploads/monthly_2023_10/"
+                                                "icons_4.png.f3290f2c17710d5ab3d0ec5f1bf99064.png")
+                        embed.add_field(name=_('Server'),
+                                        value='\n'.join([
+                                            f'- {x.display_name}' for x in bus.servers.values() if not x.is_remote
+                                        ]), inline=False)
+                        embed.set_footer(
+                            text=config.get('footer', 'Please make sure you update your DCS client to join!'))
+                        params = {
+                            "channel": config['channel'],
+                            "embed": embed.to_dict()
+                        }
+                        if 'mention' in config:
+                            params['mention'] = config['mention']
+                        await bus.send_to_node({
+                            "command": "rpc",
+                            "service": BotService.__name__,
+                            "method": "send_message",
+                            "params": params
+                        })
                 else:
                     await ServiceRegistry.get(ServiceBus).send_to_node({
                         "command": "rpc",
@@ -909,7 +939,7 @@ class NodeImpl(Node):
 
     @autoupdate.before_loop
     async def before_autoupdate(self):
-        from services import ServiceBus
+        from services.servicebus import ServiceBus
 
         # wait for all servers to be in a proper state
         while True:
@@ -918,7 +948,7 @@ class NodeImpl(Node):
                 break
             await asyncio.sleep(1)
 
-    async def add_instance(self, name: str, *, template: Optional[Instance] = None) -> Instance:
+    async def add_instance(self, name: str, *, template: str = "") -> "Instance":
         max_bot_port = max_dcs_port = max_webgui_port = -1
         for instance in self.instances:
             if instance.bot_port > max_bot_port:
@@ -936,16 +966,17 @@ class NodeImpl(Node):
         os.makedirs(os.path.join(instance.home, 'Config'), exist_ok=True)
         # should we copy from a template
         if template:
-            shutil.copy2(os.path.join(template.home, 'Config', 'autoexec.cfg'),
+            _template = next(x for x in self.node.instances if x.name == template)
+            shutil.copy2(os.path.join(_template.home, 'Config', 'autoexec.cfg'),
                          os.path.join(instance.home, 'Config'))
-            shutil.copy2(os.path.join(template.home, 'Config', 'serverSettings.lua'),
+            shutil.copy2(os.path.join(_template.home, 'Config', 'serverSettings.lua'),
                          os.path.join(instance.home, 'Config'))
-            shutil.copy2(os.path.join(template.home, 'Config', 'options.lua'),
+            shutil.copy2(os.path.join(_template.home, 'Config', 'options.lua'),
                          os.path.join(instance.home, 'Config'))
-            shutil.copy2(os.path.join(template.home, 'Config', 'network.vault'),
+            shutil.copy2(os.path.join(_template.home, 'Config', 'network.vault'),
                          os.path.join(instance.home, 'Config'))
-            if template.extensions and template.extensions.get('SRS'):
-                shutil.copy2(os.path.expandvars(template.extensions['SRS']['config']),
+            if _template.extensions and _template.extensions.get('SRS'):
+                shutil.copy2(os.path.expandvars(_template.extensions['SRS']['config']),
                              os.path.join(instance.home, 'Config', 'SRS.cfg'))
         autoexec = Autoexec(instance=instance)
         autoexec.crash_report_mode = "silent"
@@ -975,6 +1006,8 @@ class NodeImpl(Node):
         del config[self.name]['instances'][instance.name]
         with open(config_file, mode='w', encoding='utf-8') as outfile:
             yaml.dump(config, outfile)
+        if instance.server:
+            await self.unregister_server(instance.server)
         self.instances.remove(instance)
         async with self.apool.connection() as conn:
             async with conn.transaction():
@@ -988,7 +1021,7 @@ class NodeImpl(Node):
             config = yaml.load(infile)
         new_home = os.path.join(os.path.dirname(instance.home), new_name)
         os.rename(instance.home, new_home)
-        config[self.name]['instances'][new_name] = config[self.name]['instances'][instance.name].copy()
+        config[self.name]['instances'][new_name] = config[self.name]['instances'].pop(instance.name)
         config[self.name]['instances'][new_name]['home'] = new_home
         async with self.apool.connection() as conn:
             async with conn.transaction():
@@ -996,9 +1029,25 @@ class NodeImpl(Node):
                     UPDATE instances SET instance = %s 
                     WHERE node = %s AND instance = %s
                 """, (new_name, instance.node.name, instance.name, ))
+
+        def change_instance_in_config(data: dict):
+            if self.node.name in data and instance.name in data[self.node.name]:
+                data[self.node.name][new_name] = data[self.node.name].pop(instance.name)
+            elif instance.name in data:
+                data[new_name] = data.pop(instance.name)
+
+        # rename plugin configs
+        for plugin in Path(os.path.join(self.config_dir, 'plugins')).glob('*.yaml'):
+            data = yaml.load(plugin.read_text(encoding='utf-8'))
+            change_instance_in_config(data)
+            yaml.dump(data, plugin)
+        # rename service configs
+        for service in Path(os.path.join(self.config_dir, 'services')).glob('*.yaml'):
+            data = yaml.load(service.read_text(encoding='utf-8'))
+            change_instance_in_config(data)
+            yaml.dump(data, service)
         instance.name = new_name
         instance.locals['home'] = new_home
-        del config[self.name]['instances'][instance.name]
         with open(config_file, mode='w', encoding='utf-8') as outfile:
             yaml.dump(config, outfile)
 
@@ -1006,26 +1055,19 @@ class NodeImpl(Node):
         return utils.findDCSInstances()
 
     async def migrate_server(self, server: Server, instance: Instance) -> None:
-        from services import ServiceBus
+        from services.servicebus import ServiceBus
 
         await server.node.unregister_server(server)
         server = DataObjectFactory().new(ServerImpl, node=self.node, port=instance.bot_port, name=server.name)
-        server.status = Status.SHUTDOWN
-        ServiceRegistry.get(ServiceBus).servers[server.name] = server
         instance.server = server
-        config_file = os.path.join(self.config_dir, 'nodes.yaml')
-        with open(config_file, mode='r', encoding='utf-8') as infile:
-            config = yaml.load(infile)
-        config[self.name]['instances'][instance.name]['server'] = server.name
-        with open(config_file, mode='w', encoding='utf-8') as outfile:
-            yaml.dump(config, outfile)
+        ServiceRegistry.get(ServiceBus).servers[server.name] = server
+        if not self.master:
+            await ServiceRegistry.get(ServiceBus).send_init(server)
+        server.status = Status.SHUTDOWN
 
     async def unregister_server(self, server: Server) -> None:
-        config_file = os.path.join(self.config_dir, 'nodes.yaml')
+        from services.servicebus import ServiceBus
+
         instance = server.instance
         instance.server = None
-        with open(config_file, mode='r', encoding='utf-8') as infile:
-            config = yaml.load(infile)
-        del config[self.name]['instances'][instance.name]['server']
-        with open(config_file, mode='w', encoding='utf-8') as outfile:
-            yaml.dump(config, outfile)
+        ServiceRegistry.get(ServiceBus).servers.pop(server.name)

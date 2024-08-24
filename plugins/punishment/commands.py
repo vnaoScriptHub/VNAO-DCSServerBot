@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.app_commands import Range
 from discord.ext import tasks
 from psycopg.rows import dict_row
-from services import DCSServerBot
+from services.bot import DCSServerBot
 from typing import Type, Union, cast, Optional
 
 from .listener import PunishmentEventListener
@@ -122,7 +122,7 @@ class Punishment(Plugin):
             async with self.apool.connection() as conn:
                 async with conn.transaction():
                     async with conn.cursor(row_factory=dict_row) as cursor:
-                        for server_name, server in self.bot.servers.copy().items():
+                        for server_name, server in self.bot.servers.items():
                             config = self.get_config(server)
                             # we are not initialized correctly yet
                             if not config:

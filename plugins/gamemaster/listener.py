@@ -1,22 +1,22 @@
 from __future__ import annotations
+
 import asyncio
 import discord
 import logging
 import os
 import psycopg
 
-from functools import partial
-from psycopg.rows import dict_row
-
 from core import EventListener, Side, Coalition, Channel, utils, event, chat_command, CloudRotatingFileHandler, \
     get_translation, ChatCommand
 from datetime import datetime
+from psycopg.rows import dict_row
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from core import Player, Server, Plugin
 
 _ = get_translation(__name__.split('.')[1])
+INTERNAL_CAMPAIGN = '_internal_'
 
 
 class GameMasterEventListener(EventListener):
@@ -27,10 +27,16 @@ class GameMasterEventListener(EventListener):
         self.tasks: dict[str, asyncio.TimerHandle] = {}
 
     async def can_run(self, command: ChatCommand, server: Server, player: Player) -> bool:
-        coalition = await self.get_coalition(server, player)
-        if coalition and command.name in ['join', 'red', 'blue']:
+        coalitions_enabled = server.locals.get('coalitions')
+        coalition = await self.get_coalition(server, player) if coalitions_enabled else None
+        # disable -join, -red and -blue, if people are in a coalition already
+        if (not coalitions_enabled or coalition) and command.name in ['join', 'red', 'blue']:
             return False
+        # disable -leave, -password and -coalition, if people have not joined a coalition yet
         elif not coalition and command.name in ['leave', 'password', 'coalition']:
+            return False
+        # disable ack, if people do not have a message to acknowledge
+        elif command.name == 'ack' and player.ucid not in self.tasks:
             return False
         return await super().can_run(command, server, player)
 
@@ -146,7 +152,7 @@ class GameMasterEventListener(EventListener):
         asyncio.create_task(self._coalition(server, player))
         if await self.get_coalition_password(server, player.coalition):
             # noinspection PyAsyncCall
-            asyncio.create_task(self._password(server, player))
+            asyncio.create_task(self._password(server, player, True))
 
     @event(name="onMissionEvent")
     async def onMissionEvent(self, server: Server, data: dict) -> None:
@@ -207,7 +213,7 @@ class GameMasterEventListener(EventListener):
 
     @event(name="startCampaign")
     async def startCampaign(self, server: Server, data: dict) -> None:
-        name = data['name'] or '_internal_'
+        name = data.get('name') or INTERNAL_CAMPAIGN
         try:
             # noinspection PyAsyncCall
             asyncio.create_task(self.campaign('start', servers=[server], name=name))
@@ -227,8 +233,20 @@ class GameMasterEventListener(EventListener):
         if name:
             await self.campaign('delete', name=name)
         else:
-            name = '_internal_'
+            name = INTERNAL_CAMPAIGN
         await self.campaign('start', servers=[server], name=name)
+        await self.bot.bus.send_to_node({
+            "command": "rpc",
+            "service": "ServiceBus",
+            "method": "propagate_event",
+            "params": {
+                "command": "onCampaignReset",
+                "server": server.name if server else None,
+                "data": {
+                    "name": name
+                }
+            }
+        })
 
     @event(name="resetCampaign")
     async def resetCampaign(self, server: Server, _: dict) -> None:
@@ -255,9 +273,10 @@ class GameMasterEventListener(EventListener):
                 """, (server.name, player.ucid))
                 if cursor.rowcount == 1:
                     if (await cursor.fetchone())[0] != coalition.casefold():
-                        await player.sendChatMessage(_("You can't join the {coalition} coalition in-between {lock_time} of "
-                                                       "leaving a coalition.").format(
-                            coalition=coalition, lock_time=server.locals['coalitions'].get('lock_time', '1 day')))
+                        await player.sendChatMessage(
+                            _("You can't join the {coalition} coalition in-between {lock_time} of leaving a "
+                              "coalition.").format(coalition=coalition,
+                                                   lock_time=server.locals['coalitions'].get('lock_time', '1 day')))
                         await self.bot.audit(
                             f"{player.display_name} tried to join a new coalition in-between the time limit.",
                             user=player.ucid)
@@ -362,7 +381,7 @@ class GameMasterEventListener(EventListener):
     async def _coalition(self, server: Server, player: Player):
         coalition = await self.get_coalition(server, player)
         if coalition:
-            await player.sendChatMessage(_("You are a member of the {} coalition."))
+            await player.sendChatMessage(_("You are a member of the {} coalition.").format(coalition))
         else:
             await player.sendChatMessage(
                 _("You are not a member of any coalition. You can join one with {}join blue|red.").format(self.prefix))
@@ -372,11 +391,12 @@ class GameMasterEventListener(EventListener):
         # noinspection PyAsyncCall
         asyncio.create_task(self._coalition(server, player))
 
-    async def _password(self, server: Server, player: Player):
+    async def _password(self, server: Server, player: Player, init: Optional[bool] = False):
         coalition = await self.get_coalition(server, player)
         if not coalition:
-            await player.sendChatMessage(
-                _("You are not a member of any coalition. You can join one with {}join blue|red.").format(self.prefix))
+            if not init:
+                await player.sendChatMessage(_("You are not a member of any coalition. "
+                                               "You can join one with {}join blue|red.").format(self.prefix))
             return
         password = await self.get_coalition_password(server, player.coalition)
         if password:
@@ -387,7 +407,7 @@ class GameMasterEventListener(EventListener):
     @chat_command(name="password", aliases=["passwd"], help=_("displays the coalition password"))
     async def password(self, server: Server, player: Player, params: list[str]):
         # noinspection PyAsyncCall
-        asyncio.create_task(self._password(server, player))
+        asyncio.create_task(self._password(server, player, False))
 
     @chat_command(name="flag", roles=['DCS Admin', 'GameMaster'], usage=_("<flag> [value]"),
                   help=_("reads or sets a flag"))
@@ -415,7 +435,7 @@ class GameMasterEventListener(EventListener):
                 await conn.execute("""
                     DELETE FROM messages m WHERE m.player_ucid = %s 
                 """, (player.ucid, ))
-        task = self.tasks.pop(player.ucid)
+        task = self.tasks.pop(player.ucid, None)
         if task:
             task.cancel()
         await player.sendChatMessage(_("Message(s) acknowledged."))

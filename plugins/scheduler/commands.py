@@ -1,17 +1,20 @@
 import asyncio
 import discord
 import os
+import psycopg
 
 from contextlib import suppress
 from core import Plugin, PluginRequiredError, utils, Status, Server, Coalition, Channel, TEventListener, Group, Node, \
-    Instance
+    Instance, DEFAULT_TAG
 from datetime import datetime, timedelta, timezone
 from discord import app_commands
 from discord.ext import tasks
 from discord.ui import Modal, TextInput
 from functools import partial
-from services import DCSServerBot
+from pathlib import Path
+from services.bot import DCSServerBot
 from typing import Type, Optional, Literal, Union
+from zoneinfo import ZoneInfo
 
 from .listener import SchedulerListener
 from .views import ConfigView
@@ -37,10 +40,41 @@ class Scheduler(Plugin):
             config = {self.node.name: {}}
             for instance in self.bus.node.instances:
                 config[self.node.name][instance.name] = {}
+            os.makedirs(os.path.join(self.node.config_dir, 'plugins'), exist_ok=True)
             with open(os.path.join(self.node.config_dir, 'plugins', 'scheduler.yaml'), mode='w',
                       encoding='utf-8') as outfile:
                 yaml.dump(config, outfile)
         return config
+
+    async def migrate(self, new_version: str, conn: Optional[psycopg.AsyncConnection] = None) -> None:
+        if new_version == '3.1':
+            def _change_instance(instance: dict):
+                if 'restart' in instance:
+                    instance['action'] = instance.pop('restart')
+                    if isinstance(instance['action'], list):
+                        for action in instance['action']:
+                            if action['method'] == 'restart_with_shutdown':
+                                action['method'] = 'restart'
+                                action['shutdown'] = True
+                    else:
+                        if instance['action']['method'] == 'restart_with_shutdown':
+                            instance['action']['method'] = 'restart'
+                            instance['action']['shutdown'] = True
+
+            config = os.path.join(self.node.config_dir, 'plugins', f'{self.plugin_name}.yaml')
+            data = yaml.load(Path(config).read_text(encoding='utf-8'))
+            if self.node.name in data.keys():
+                for name, node in data.items():
+                    if name == DEFAULT_TAG:
+                        _change_instance(node)
+                        continue
+                    for instance in node.values():
+                        _change_instance(instance)
+            else:
+                for instance in data.values():
+                    _change_instance(instance)
+            with open(config, mode='w', encoding='utf-8') as outfile:
+                yaml.dump(data, outfile)
 
     @staticmethod
     async def check_server_state(server: Server, config: dict) -> Status:
@@ -48,22 +82,28 @@ class Scheduler(Plugin):
             warn_times: list[int] = Scheduler.get_warn_times(config) if server.is_populated() else [0]
             restart_in: int = max(warn_times)
             now: datetime = datetime.now()
+            tz = now.astimezone().tzinfo
+            now = now.replace(tzinfo=tz)
             weekday = (now + timedelta(seconds=restart_in)).weekday()
-            for period, daystate in config['schedule'].items():  # type: str, dict
+            for period, daystate in config['schedule'].items():  # type: str, str
+                if period == 'timezone':
+                    tz = ZoneInfo(daystate)
+                    continue
                 if len(daystate) != 7:
                     server.log.error(f"Error in scheduler.yaml: {daystate} has to be 7 characters long!")
                 state = daystate[weekday]
                 # check, if the server should be running
-                if utils.is_in_timeframe(now, period) and state.upper() == 'Y' and server.status == Status.SHUTDOWN:
+                if (utils.is_in_timeframe(now, period, tz) and state.upper() == 'Y' and
+                        server.status == Status.SHUTDOWN):
                     return Status.RUNNING
-                elif utils.is_in_timeframe(now, period) and state.upper() == 'P' and \
-                        server.status in [Status.RUNNING, Status.PAUSED, Status.STOPPED] and not server.is_populated():
+                elif (utils.is_in_timeframe(now, period, tz) and state.upper() == 'P' and
+                      server.status in [Status.RUNNING, Status.PAUSED, Status.STOPPED] and not server.is_populated()):
                     return Status.SHUTDOWN
-                elif utils.is_in_timeframe(now + timedelta(seconds=restart_in), period) and state.upper() == 'N' and \
-                        server.status == Status.RUNNING:
+                elif (utils.is_in_timeframe(now + timedelta(seconds=restart_in), period, tz) and
+                      state.upper() == 'N' and server.status == Status.RUNNING):
                     return Status.SHUTDOWN
-                elif utils.is_in_timeframe(now, period) and state.upper() == 'N' and \
-                        server.status in [Status.PAUSED, Status.STOPPED]:
+                elif (utils.is_in_timeframe(now, period, tz) and state.upper() == 'N' and
+                      server.status in [Status.PAUSED, Status.STOPPED]):
                     return Status.SHUTDOWN
         return server.status
 
@@ -221,32 +261,77 @@ class Scheduler(Plugin):
             server.restart_pending = True
 
         try:
-            if 'shutdown' in method:
-                self.log.debug(f"Scheduler: Shutting down DCS Server {server.name}")
+            if method == 'shutdown' or rconf.get('shutdown', False):
+                self.log.debug(f"Scheduler: Shutting down DCS Server {server.name} ...")
                 await self.teardown_dcs(server)
-            if method == 'restart_with_shutdown':
+            if method == 'restart':
                 try:
-                    self.log.debug(f"Scheduler: Starting DCS Server {server.name}")
-                    await self.launch_dcs(server)
+                    modify_mission = rconf.get('run_extensions', True)
+                    if server.status == Status.SHUTDOWN:
+                        self.log.debug(f"Scheduler: Starting DCS Server {server.name}")
+                        await asyncio.sleep(self.get_config(server).get('startup_delay', 0))
+                        await self.launch_dcs(server, modify_mission=modify_mission)
+                    else:
+                        self.log.debug(f"Scheduler: Restarting mission on server {server.name} ...")
+                        await server.restart(modify_mission=modify_mission)
+                    await self.bot.audit(f"{self.plugin_name.title()} restarted mission "
+                                         f"{server.current_mission.display_name}", server=server)
                 except (TimeoutError, asyncio.TimeoutError):
                     await self.bot.audit(f"{self.plugin_name.title()}: Timeout while starting server",
                                          server=server)
-            elif method == 'restart':
-                self.log.debug(f"Scheduler: Restarting mission on server {server.name}")
-                await server.restart()
-                await self.bot.audit(f"{self.plugin_name.title()} restarted mission "
-                                     f"{server.current_mission.display_name}", server=server)
             elif method == 'rotate':
-                self.log.debug(f"Scheduler: Rotating mission on server {server.name}")
-                await server.loadNextMission()
-                await self.bot.audit(f"{self.plugin_name.title()} rotated to mission "
-                                     f"{server.current_mission.display_name}", server=server)
+                try:
+                    self.log.debug(f"Scheduler: Rotating mission on server {server.name} ...")
+                    modify_mission = rconf.get('run_extensions', True)
+                    if server.status == Status.SHUTDOWN:
+                        await server.setStartIndex(server.settings['listStartIndex'] + 1)
+                        self.log.debug(f"Scheduler: Starting DCS Server {server.name} ...")
+                        await self.launch_dcs(server, modify_mission=modify_mission)
+                    else:
+                        await server.loadNextMission(modify_mission=modify_mission)
+                    await self.bot.audit(f"{self.plugin_name.title()} rotated to mission "
+                                         f"{server.current_mission.display_name}", server=server)
+                except (TimeoutError, asyncio.TimeoutError):
+                    await self.bot.audit(f"{self.plugin_name.title()}: Timeout while starting server",
+                                         server=server)
+            elif method == 'load':
+                try:
+                    mission_id = rconf.get('mission_id')
+                    if not mission_id:
+                        filename = rconf.get('mission_file')
+                    else:
+                        filename = None
+                    if not mission_id and not filename:
+                        self.log.error("You need to provide either mission_id or filename to your load configuration!")
+                        return
+                    if not mission_id:
+                        for idx, mission in enumerate(server.settings['missionList']):
+                            if os.path.basename(mission).lower() == filename.lower():
+                                mission_id = idx + 1
+                                break
+                        else:
+                            self.log.error(f"No mission with name {filename} found in your serverSettings.lua!")
+                            return
+                    self.log.debug(f"Scheduler: Loading mission {mission_id} on server {server.name} ...")
+                    modify_mission = rconf.get('run_extensions', True)
+                    if server.status == Status.SHUTDOWN:
+                        await server.setStartIndex(mission_id)
+                        self.log.debug(f"Scheduler: Starting DCS Server {server.name} ...")
+                        await self.launch_dcs(server, modify_mission=modify_mission)
+                    else:
+                        await server.loadMission(mission=mission_id, modify_mission=modify_mission)
+                    await self.bot.audit(f"{self.plugin_name.title()} loaded mission "
+                                         f"{server.current_mission.display_name}", server=server)
+                except (TimeoutError, asyncio.TimeoutError):
+                    await self.bot.audit(f"{self.plugin_name.title()}: Timeout while starting server",
+                                         server=server)
+
         except Exception as ex:
-            self.log.error(f"Error with method {method} on server {server.name}: {ex}")
+            self.log.error(f"Error with method {method} on server {server.name}: {ex}", exc_info=True)
             server.restart_pending = False
 
     async def check_mission_state(self, server: Server, config: dict):
-        def check_mission_restart(rconf: dict):
+        def check_action(rconf: dict):
             # calculate the time when the mission has to restart
             if server.is_populated():
                 warn_times = Scheduler.get_warn_times(config)
@@ -258,6 +343,12 @@ class Scheduler(Plugin):
                     restart_time = datetime.now() + timedelta(seconds=warn_time)
                     for t in rconf['local_times']:
                         if utils.is_in_timeframe(restart_time, t):
+                            asyncio.create_task(self.restart_mission(server, config, rconf, warn_time))
+                            return
+                elif 'utc_times' in rconf:
+                    restart_time = datetime.now(tz=timezone.utc) + timedelta(seconds=warn_time)
+                    for t in rconf['utc_times']:
+                        if utils.is_in_timeframe(restart_time, t, tz=timezone.utc):
                             asyncio.create_task(self.restart_mission(server, config, rconf, warn_time))
                             return
                 elif 'mission_time' in rconf:
@@ -279,22 +370,22 @@ class Scheduler(Plugin):
                         if restart_in < 0:
                             restart_in = 0
                         if rconf['method'] == 'restart':
-                            rconf['method'] = 'restart_with_shutdown'
+                            rconf['shutdown'] = True
                         asyncio.create_task(self.restart_mission(server, config, rconf, restart_in))
                         return
 
-        if 'restart' in config and not server.restart_pending:
-            if isinstance(config['restart'], list):
-                for r in config['restart']:
-                    check_mission_restart(r)
+        if 'action' in config and not server.restart_pending:
+            if isinstance(config['action'], list):
+                for r in config['action']:
+                    check_action(r)
             else:
-                check_mission_restart(config['restart'])
+                check_action(config['action'])
 
     @tasks.loop(minutes=1.0)
     async def check_state(self):
         next_startup = 0
         startup_delay = self.get_config().get('startup_delay', 10)
-        for server_name, server in self.bot.servers.copy().items():
+        for server_name, server in self.bot.servers.items():
             # only care about servers that are not in the startup phase
             if server.status in [Status.UNREGISTERED, Status.LOADING] or server.maintenance:
                 continue
@@ -414,6 +505,9 @@ class Scheduler(Plugin):
                         )
                     )
                     await interaction.followup.send(embed=embed, file=file, ephemeral=ephemeral)
+            except Exception as ex:
+                self.log.error(ex)
+                await interaction.followup.send(ex, ephemeral=ephemeral)
             finally:
                 try:
                     await msg.delete()
@@ -486,7 +580,7 @@ class Scheduler(Plugin):
     @app_commands.guild_only()
     @utils.app_has_role('DCS Admin')
     async def start(self, interaction: discord.Interaction,
-                    server: app_commands.Transform[Server, utils.ServerTransformer]):
+                    server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.STOPPED])]):
         ephemeral = utils.get_ephemeral(interaction)
         if server.status == Status.STOPPED:
             # noinspection PyUnresolvedReferences
@@ -723,7 +817,7 @@ class Scheduler(Plugin):
                                Status.RUNNING, Status.PAUSED
                            ])
                        ]):
-        config = self.get_config(_server).get('restart')
+        config = self.get_config(_server).get('action')
         if not config:
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message("No restart configured for this server.", ephemeral=True)
@@ -740,15 +834,12 @@ class Scheduler(Plugin):
         # noinspection PyUnresolvedReferences
         restart_in, rconf = self.eventlistener.get_next_restart(_server, config)
         what = rconf['method']
-        if what == 'restart_with_shutdown':
-            what = 'restart'
-            item = f'Server {_server.name}'
-        elif what == 'shutdown':
+        if what == 'shutdown' or config.get('shutdown', False):
             item = f'Server {_server.name}'
         else:
             item = f'The mission on server {_server.name}'
         message = f"{item} will {what}"
-        if 'local_times' in rconf or 'real_time' in rconf or _server.status == Status.RUNNING:
+        if 'local_times' in rconf or 'utc_times' in rconf or 'real_time' in rconf or _server.status == Status.RUNNING:
             if _server.restart_time >= datetime.now(tz=timezone.utc):
                 message += f" <t:{int(_server.restart_time.timestamp())}:R>"
             else:

@@ -12,7 +12,7 @@ from discord import app_commands
 from discord.app_commands import Range
 from discord.ext import commands
 from jsonschema import validate, ValidationError
-from services import DCSServerBot
+from services.bot import DCSServerBot
 from typing import Optional, Literal, Union
 
 from .listener import GameMasterEventListener
@@ -461,7 +461,8 @@ class GameMaster(Plugin):
             async with session.get(message.attachments[0].url) as response:
                 if response.status == 200:
                     data = await response.json(encoding="utf-8")
-                    with open('plugins/gamemaster/schemas/embed_schema.json', mode='r') as infile:
+                    with open(os.path.join('plugins', self.plugin_name, 'schemas', 'embed_schema.json'),
+                              mode='r') as infile:
                         schema = json.load(infile)
                     try:
                         validate(instance=data, schema=schema)

@@ -79,7 +79,7 @@ class Node:
 
     @property
     def extensions(self) -> dict:
-        raise NotImplemented()
+        return self.locals.get('extensions', {})
 
     def read_config(self, file: str) -> dict:
         try:
@@ -94,7 +94,7 @@ class Node:
             if database_url:
                 url = urlparse(database_url)
                 if url.password != 'SECRET':
-                    utils.set_password('database', url.password)
+                    utils.set_password('database', url.password, self.config_dir)
                     port = url.port or 5432
                     config['database']['url'] = \
                         f"{url.scheme}://{url.username}:SECRET@{url.hostname}:{port}{url.path}?sslmode=prefer"
@@ -108,19 +108,6 @@ class Node:
             config['logging']['loglevel'] = config['logging'].get('loglevel', 'DEBUG')
             config['logging']['logrotate_size'] = config['logging'].get('logrotate_size', 10485760)
             config['logging']['logrotate_count'] = config['logging'].get('logrotate_count', 5)
-            config['messages'] = config.get('messages', {})
-            config['messages']['player_username'] = config['messages'].get(
-                'player_username',
-                _('Your player name contains invalid characters. Please change your name to join our server.')
-            )
-            config['messages']['player_default_username'] = config['messages'].get(
-                'player_default_username',
-                _('Please change your default player name at the top right of the multiplayer selection list to an '
-                  'individual one!')
-            )
-            config['messages']['player_banned'] = config['messages'].get(
-                'player_banned', _('You are banned from this server. Reason: {}')
-            )
             config['chat_command_prefix'] = config.get('chat_command_prefix', '-')
             return config
         except (FileNotFoundError, CoreError):
@@ -131,7 +118,7 @@ class Node:
     def read_locals(self) -> dict:
         raise NotImplemented()
 
-    async def shutdown(self):
+    async def shutdown(self, rc: int = -2):
         raise NotImplemented()
 
     async def restart(self):
@@ -182,7 +169,7 @@ class Node:
     async def rename_server(self, server: "Server", new_name: str):
         raise NotImplemented()
 
-    async def add_instance(self, name: str, *, template: Optional["Instance"] = None) -> "Instance":
+    async def add_instance(self, name: str, *, template: str = "") -> "Instance":
         raise NotImplemented()
 
     async def delete_instance(self, instance: "Instance", remove_files: bool) -> None:

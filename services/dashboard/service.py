@@ -68,7 +68,7 @@ class ServersWidget:
             name = re.sub(self.bus.filter['server_name'], '', server.name).strip()
             mission_name = re.sub(self.bus.filter['mission_name'], '',
                                   server.current_mission.name).strip() if server.current_mission else "n/a"
-            num_players = f"{len(server.get_active_players()) + 1}/{server.settings['maxPlayers']}" \
+            num_players = f"{len(server.get_active_players()) + 1}/{server.settings.get('maxPlayers', 16)}" \
                 if server.current_mission else "n/a"
             if self.service.node.master and self.service.is_multinode():
                 table.add_row(server.status.name.title(), name, mission_name, num_players, server.node.name)
@@ -224,6 +224,8 @@ class Dashboard(Service):
         self.log.root.addHandler(self.old_handler)
 
     async def start(self):
+        if not self.node.config.get('use_dashboard', True):
+            return
         await super().start()
         self.bus = ServiceRegistry.get(ServiceBus)
         self.hook_logging()
@@ -233,12 +235,18 @@ class Dashboard(Service):
         self.update_task = asyncio.create_task(self.update())
 
     async def stop(self):
+        if not self.node.config.get('use_dashboard', True):
+            return
         self.stop_event.set()
         if self.update_task:
             await self.update_task
         self.unhook_logging()
         self.console.clear()
         await super().stop()
+
+    async def switch(self):
+        await self.stop()
+        await self.start()
 
     async def update(self):
         try:

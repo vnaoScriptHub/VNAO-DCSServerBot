@@ -45,6 +45,21 @@ class SchedulerListener(EventListener):
                     return min_time_difference, restart
                 else:
                     return None
+            elif 'utc_times' in restart:
+                min_time_difference = 86400
+                for t in restart['utc_times']:
+                    restart_time = utils.parse_time(t, tz=timezone.utc)
+                    check_time = datetime.now(tz=timezone.utc).replace(
+                        year=restart_time.year, month=restart_time.month, day=restart_time.day, second=0, microsecond=0)
+                    if restart_time <= check_time:
+                        restart_time += timedelta(days=1)
+                    time_difference_in_seconds = int((restart_time - check_time).total_seconds())
+                    if 0 < time_difference_in_seconds < min_time_difference:
+                        min_time_difference = time_difference_in_seconds
+                if min_time_difference != 86400:
+                    return min_time_difference, restart
+                else:
+                    return None
 
     async def run(self, server: Server, method: str) -> None:
         if method.startswith('load:'):
@@ -115,29 +130,35 @@ class SchedulerListener(EventListener):
                 await server.start()
         server.restart_pending = False
 
-    async def _init_extensions(self, server: Server, data: dict) -> None:
+    async def _init_extensions(self, server: Server) -> None:
         try:
-            # init and start extensions if necessary
-            if data['channel'].startswith('sync-'):
-                await server.init_extensions()
+            await server.init_extensions()
+        except (TimeoutError, asyncio.TimeoutError):
+            self.log.error(f"Timeout while initializing extensions for server {server.name}!")
+
+    async def _startup_extensions(self, server: Server) -> None:
+        try:
             await server.startup_extensions()
         except (TimeoutError, asyncio.TimeoutError):
-            self.log.error(f"Timeout while loading extensions for server {server.name}!")
+            self.log.error(f"Timeout while starting extensions for server {server.name}!")
 
     @event(name="registerDCSServer")
     async def registerDCSServer(self, server: Server, data: dict) -> None:
-        # noinspection PyAsyncCall
-        asyncio.create_task(self._init_extensions(server, data))
         if data['channel'].startswith('sync-'):
+            # noinspection PyAsyncCall
+            asyncio.create_task(self._init_extensions(server))
+            if data.get('players'):
+                # noinspection PyAsyncCall
+                asyncio.create_task(self._startup_extensions(server))
             self.set_restart_time(server)
 
     @event(name="onPlayerStart")
     async def onPlayerStart(self, server: Server, data: dict) -> None:
         if data['id'] == 1 or 'ucid' not in data:
             return
-        restart = self.get_config(server).get('restart')
-        if restart:
-            restart_in, rconf = self.get_next_restart(server, restart)
+        action = self.get_config(server).get('action')
+        if action:
+            restart_in, rconf = self.get_next_restart(server, action)
             # do not print any chat message when the server is set to restart on populated = False
             if not rconf.get('populated', True):
                 return
@@ -179,6 +200,8 @@ class SchedulerListener(EventListener):
 
     @event(name="onSimulationStart")
     async def onSimulationStart(self, server: Server, _: dict) -> None:
+        # noinspection PyAsyncCall
+        asyncio.create_task(self._startup_extensions(server))
         config = self.plugin.get_config(server)
         if config and 'onMissionStart' in config:
             # noinspection PyAsyncCall
@@ -222,10 +245,10 @@ class SchedulerListener(EventListener):
         config = self.get_config(server)
         if not config or not server.current_mission:
             return
-        restart = config.get('restart')
-        if not restart:
+        action = config.get('action')
+        if not action:
             return
-        result = self.get_next_restart(server, restart)
+        result = self.get_next_restart(server, action)
         if result:
             server.restart_time = datetime.now(tz=timezone.utc) + timedelta(seconds=result[0])
 
@@ -256,9 +279,9 @@ class SchedulerListener(EventListener):
 
     @chat_command(name="timeleft", help="Time to the next restart")
     async def timeleft(self, server: Server, player: Player, params: list[str]):
-        restart = self.get_config(server).get('restart')
-        if not restart:
-            await player.sendChatMessage("No restart configured for this server.")
+        action = self.get_config(server).get('action')
+        if not action:
+            await player.sendChatMessage("No action configured for this server.")
             return
         elif server.maintenance:
             await player.sendChatMessage("Maintenance mode active, mission will not restart.")
@@ -266,7 +289,7 @@ class SchedulerListener(EventListener):
         elif not server.restart_time:
             await player.sendChatMessage("Please try again in a minute.")
             return
-        restart_in, rconf = self.get_next_restart(server, restart)
+        restart_in, rconf = self.get_next_restart(server, action)
         message = f"The mission will restart in {utils.format_time(restart_in)}"
         if not rconf.get('populated', True) and not rconf.get('max_mission_time'):
             message += ", if all players have left"

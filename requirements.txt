@@ -1,23 +1,23 @@
 # AIOFiles: File support for python's asyncio
-aiofiles==23.2.1
+aiofiles==24.1.0
 
 # AIOHTTP: Uses asyncio for async/await native coroutines for establishing and handling HTTP connections
 aiohttp==3.9.5
 
 # Certifi: Python package for providing Mozilla's CA Bundle
-certifi==2024.6.2
+certifi==2024.7.4
 
 # Croniter: Python iterator implementing a cron schedule format
-croniter==2.0.5
+croniter==3.0.3
 
 # discord.py: The python interface for the Discord API
-discord.py==2.3.2
+discord.py==2.4.0
 
 # eyeD3: Python module and program for processing ID3 tags (metadata) in MP3 files
 eyeD3==0.9.7
 
 # FastAPI: A modern, fast (high-performance), web framework for building APIs with Python 3.6+ based on standard Python type hints
-fastapi==0.111.0
+fastapi==0.112.1
 
 # FuzzyWuzzy: Python library that uses Levenshtein Distance to calculate the differences between strings
 fuzzywuzzy==0.18.0
@@ -26,16 +26,16 @@ fuzzywuzzy==0.18.0
 GitPython==3.1.43
 
 # jsonschema: An implementation of JSON Schema for Python
-jsonschema==4.22.0
+jsonschema==4.23.0
 
 # Matplotlib: Python 2D plotting library
-matplotlib==3.9.0
+matplotlib==3.9.2
 
 # Minidump: Windows Minidump file reader
-minidump==0.0.23; sys_platform == 'win32'
+minidump==0.0.24; sys_platform == 'win32'
 
 # NumPy: Package for scientific computing with Python
-numpy==2.0.0
+numpy==2.1.0
 
 # Openpyxl: Python library to read/write Excel 2010 xlsx/xlsm/xltx/xltm files
 openpyxl==3.1.2
@@ -49,11 +49,8 @@ packaging==24.1
 # PID: Pidfile implementation by using a Unix PID file
 pid==3.0.4
 
-# PIP: The Python package manager
-pip==24.1
-
 # Psycopg: PostgreSQL database adapter for Python
-psycopg[binary]==3.1.19
+psycopg[binary]==3.2.1
 
 # Psycopg Pool: PostgreSQL database adapter pool for Python
 psycopg-pool==3.2.2
@@ -62,7 +59,7 @@ psycopg-pool==3.2.2
 psutil==6.0.0
 
 # PyArrow: Python library providing high-performance tools for doing analytics on Arrow-based columnar data
-pyarrow==16.1.0
+pyarrow==17.0.0
 
 # pyKwalify: A Python library for YAML/JSON schema validation
 pykwalify==1.8.0
@@ -72,9 +69,6 @@ python-Levenshtein==0.25.1
 
 # python-multipart: A library for parsing multipart/form-data input requests
 python-multipart==0.0.9
-
-# pywin32: Set of python extensions for Windows provided by Microsoft
-pypiwin32==223; sys_platform == 'win32'
 
 # Pywin32: Set of Python extensions for MS Windows
 pywin32==306; sys_platform == 'win32'
@@ -95,7 +89,7 @@ seaborn==0.13.2
 trueskill==0.4.5
 
 # Uvicorn: ASGI server implemented using asyncio and uvloop
-uvicorn==0.30.1
+uvicorn==0.30.6
 
 # Watchdog: API library and shell utilities to monitor file system events
-watchdog==4.0.1
+watchdog==4.0.2

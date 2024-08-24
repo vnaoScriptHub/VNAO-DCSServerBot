@@ -4,13 +4,16 @@ import discord
 import os
 import shlex
 
+from copy import deepcopy
 from core import utils, EventListener, PersistentReport, Plugin, Report, Status, Side, Mission, Player, Coalition, \
-    Channel, DataObjectFactory, event, chat_command, ServiceRegistry
+    Channel, DataObjectFactory, event, chat_command, ServiceRegistry, ChatCommand
 from datetime import datetime, timezone
 from discord.ext import tasks
 from psycopg.rows import dict_row
-from services import ServiceBus
+from services.servicebus import ServiceBus
+from services.bot.dummy import DummyBot
 from typing import TYPE_CHECKING, Callable, Coroutine
+
 
 if TYPE_CHECKING:
     from core import Server
@@ -28,7 +31,7 @@ class MissionEventListener(EventListener):
             'friendly_fire': '```ansi\n\u001b[1;33mBLUE {} FRIENDLY FIRE onto {} with {}.```',
             'self_kill': '```ansi\n\u001b[0;34mBLUE player {} killed themselves - Ooopsie!```',
             'change_slot': '```ansi\n\u001b[0;34m{} player {} occupied {} {}```',
-            'disconnect': '```ansi\n\u001b[0;34mBLUE player {} disconnected```'
+            'disconnect': '```ansi\n\u001b[0;34mBLUE player {} disconnected from server {}```'
         },
         Side.RED: {
             'takeoff': '```ansi\n\u001b[0;31mRED player {} took off from {}.```',
@@ -40,7 +43,7 @@ class MissionEventListener(EventListener):
             'friendly_fire': '```ansi\n\u001b[1;33mRED {} FRIENDLY FIRE onto {} with {}.```',
             'self_kill': '```ansi\n\u001b[0;31mRED player {} killed themselves - Ooopsie!```',
             'change_slot': '```ansi\n\u001b[0;31m{} player {} occupied {} {}```',
-            'disconnect': '```ansi\n\u001b[0;31mRED player {} disconnected```'
+            'disconnect': '```ansi\n\u001b[0;31mRED player {} disconnected from server {}```'
         },
         Side.NEUTRAL: {
             'takeoff': '```ansi\n\u001b[0;32mNEUTRAL player {} took off from {}.```',
@@ -52,11 +55,11 @@ class MissionEventListener(EventListener):
             'friendly_fire': '```ansi\n\u001b[1;33mNEUTRAL {} FRIENDLY FIRE onto {} with {}.```',
             'self_kill': '```ansi\n\u001b[0;32mNEUTRAL player {} killed themselves - Ooopsie!```',
             'change_slot': '```ansi\n\u001b[0;32m{} player {} occupied {} {}```',
-            'disconnect': '```ansi\n\u001b[0;32mNEUTRAL player {} disconnected```'
+            'disconnect': '```ansi\n\u001b[0;32mNEUTRAL player {} disconnected from server {}```'
         },
         Side.SPECTATOR: {
-            'connect': '```\nPlayer {} connected to server```',
-            'disconnect': '```\nPlayer {} disconnected```',
+            'connect': '```\nPlayer {} connected to server {}```',
+            'disconnect': '```\nPlayer {} disconnected from server {}```',
             'spectators': '```\n{} player {} returned to Spectators```',
             'takeoff': '```\nPlayer {} took off from {}.```',
             'landing': '```\nPlayer {} landed at {}.```',
@@ -93,6 +96,13 @@ class MissionEventListener(EventListener):
         await self.work_queue()
         self.update_player_embed.cancel()
         self.update_mission_embed.cancel()
+
+    async def can_run(self, command: ChatCommand, server: Server, player: Player) -> bool:
+        # linkme is only available, if the player is not linked and if a Discord bot is available
+        if command.name == 'linkme':
+            if player.verified or isinstance(self.bot, DummyBot):
+                return False
+        return await super().can_run(command, server, player)
 
     async def work_queue(self):
         for channel in list(self.queue.keys()):
@@ -170,7 +180,7 @@ class MissionEventListener(EventListener):
     async def sendMessage(self, server: Server, data: dict) -> None:
         channel_id = int(data['channel'])
         if channel_id == -1:
-            channel_id = server.channels[Channel.EVENTS]
+            channel_id = server.channels.get(Channel.EVENTS, -1)
         channel = self.bot.get_channel(channel_id)
         if channel:
             message = "```" + data['message'] + "```"
@@ -328,11 +338,30 @@ class MissionEventListener(EventListener):
 
     @event(name="registerDCSServer")
     async def registerDCSServer(self, server: Server, data: dict) -> None:
+        channels = deepcopy(server.locals.get('channels'))
+        if 'admin' not in channels:
+            channels['admin'] = self.bot.get_admin_channel(server).id
+        # noinspection PyAsyncCall
+        asyncio.create_task(server.send_to_dcs({
+            'command': 'loadParams',
+            'plugin': self.plugin_name,
+            'params': {
+                "chat_command_prefix": self.prefix,
+                "profanity_filter": server.locals.get('profanity_filter', False),
+                "messages": server.locals.get('messages'),
+                "channels": channels,
+                "slot_spamming": server.locals.get('slot_spamming')
+            }
+        }))
         if not data.get('current_mission'):
             server.status = Status.STOPPED
             return
         self._update_mission(server, data)
         if data['channel'].startswith('sync-'):
+            if not data.get('players'):
+                server.players.clear()
+                server.status = Status.STOPPED
+                return
             # noinspection PyAsyncCall
             asyncio.create_task(self._update_bans(server))
             # get the weather async (if not filled already)
@@ -343,10 +372,6 @@ class MissionEventListener(EventListener):
             if not data.get('airbases'):
                 # noinspection PyAsyncCall
                 asyncio.create_task(self._load_airbases(server))
-        if not data.get('players'):
-            server.players.clear()
-            data['players'] = []
-            server.status = Status.STOPPED
         server.afk.clear()
         # all players are inactive for now
         for p in server.players.values():
@@ -386,10 +411,11 @@ class MissionEventListener(EventListener):
         # remove roles
         if server.locals.get('autorole'):
             role = self.bot.get_role(server.locals.get('autorole'))
-            all_members = set(x.member for x in server.players.values() if x.member)
-            for member in (set(role.members) - all_members):
-                # noinspection PyAsyncCall
-                asyncio.create_task(member.remove_roles(role))
+            if role:
+                all_members = set(x.member for x in server.players.values() if x.member)
+                for member in (set(role.members) - all_members):
+                    # noinspection PyAsyncCall
+                    asyncio.create_task(member.remove_roles(role))
         # Set the status at the latest possible place
         if data['channel'].startswith('sync-'):
             server.status = Status.PAUSED if data['pause'] is True else Status.RUNNING
@@ -418,9 +444,24 @@ class MissionEventListener(EventListener):
         asyncio.create_task(self._update_bans(server))
         self.display_mission_embed(server)
 
+    async def _smooth_pause(self, server: Server, seconds: int):
+        if server.current_mission:
+            self.log.debug(f"Smooth pausing server {server.name} after {seconds}s")
+            await server.current_mission.unpause()
+            await asyncio.sleep(seconds)
+            if not server.get_active_players():
+                await server.current_mission.pause()
+
     @event(name="onSimulationStart")
     async def onSimulationStart(self, server: Server, _: dict) -> None:
         server.status = Status.PAUSED
+        # If the server is PAUSED and smooth_pause is configured, start it for some seconds and pause it again,
+        # to let all scripts load properly.
+        if server.settings.get('advanced', {}).get('resume_mode', 0) == 2:
+            smooth_pause = server.locals.get('smooth_pause', 0)
+            if smooth_pause > 0:
+                # noinspection PyAsyncCall
+                asyncio.create_task(self._smooth_pause(server, smooth_pause))
         self.display_mission_embed(server)
 
     @event(name="getMissionUpdate")
@@ -459,7 +500,8 @@ class MissionEventListener(EventListener):
     async def onPlayerConnect(self, server: Server, data: dict) -> None:
         if data['id'] == 1:
             return
-        self.send_dcs_event(server, Side.SPECTATOR, self.EVENT_TEXTS[Side.SPECTATOR]['connect'].format(data['name']))
+        self.send_dcs_event(server, Side.SPECTATOR, self.EVENT_TEXTS[Side.SPECTATOR]['connect'].format(
+            data['name'], server.name))
         player: Player = server.get_player(ucid=data['ucid'])
         if not player or player.id == 1:
             player = DataObjectFactory().new(
@@ -479,16 +521,17 @@ class MissionEventListener(EventListener):
             asyncio.create_task(self._watchlist_alert(server, player))
 
         # check if we've reached the max_threshold
-        config = self.get_config(server)
-        mt = config.get('usage_alarm', {}).get('max_threshold')
+        usage_alarm = server.locals.get('usage_alarm', {})
+        mt = usage_alarm.get('max_threshold')
         if mt and len(server.get_active_players()) == (mt + 1):
             # noinspection PyAsyncCall
-            asyncio.create_task(self._threshold_alert(server, config['usage_alarm']))
+            asyncio.create_task(self._threshold_alert(server, usage_alarm))
 
     @event(name="onPlayerStart")
     async def onPlayerStart(self, server: Server, data: dict) -> None:
         if data['id'] == 1 or 'ucid' not in data:
             return
+        messages = server.locals['messages']
         # check if the server only allows linked members to join
         discord_roles = server.locals.get('discord')
         if server.locals.get('force_voice', False) and not discord_roles:
@@ -501,8 +544,7 @@ class MissionEventListener(EventListener):
                 asyncio.create_task(server.send_to_dcs({
                     "command": "kick",
                     "id": data['id'],
-                    "reason": server.locals.get('message_reserved', 'This server is locked for specific users.\n'
-                                                                    'Please contact a server admin.')
+                    "reason": messages['message_reserved']
                 }))
                 return
         player: Player = server.get_player(ucid=data['ucid'])
@@ -516,9 +558,8 @@ class MissionEventListener(EventListener):
         # security check, if a banned player somehow managed to get here (should never happen)
         if player.is_banned():
             # noinspection PyAsyncCall
-            asyncio.create_task(server.kick(player, self.node.config.get('messages', {}).get('player_banned', 'n/a')))
+            asyncio.create_task(server.kick(player, messages['message_ban'].format('n/a')))
             return
-        config = self.get_config(server)
         # greet the player
         if not player.member:
             # only warn for unknown users if it is a non-public server and automatch is on
@@ -526,16 +567,14 @@ class MissionEventListener(EventListener):
                 # noinspection PyAsyncCall
                 asyncio.create_task(self.bot.get_admin_channel(server).send(
                     f"Player {player.display_name} (ucid={player.ucid}) can't be matched to a discord user."))
-            # noinspection PyAsyncCall
-            asyncio.create_task(player.sendChatMessage(config.get(
-                'greeting_message_unmatched', '{player.name}, please use /linkme in our Discord, '
-                                              'if you want to see your user stats!').format(server=server,
-                                                                                            player=player)))
+            if not isinstance(self.bot, DummyBot):
+                # noinspection PyAsyncCall
+                asyncio.create_task(player.sendChatMessage(
+                    messages['greeting_message_unmatched'].format(server=server, player=player)))
         else:
             # noinspection PyAsyncCall
-            asyncio.create_task(player.sendChatMessage(config.get(
-                'greeting_message_members', '{player.name}, welcome back to {server.name}!').format(player=player,
-                                                                                                    server=server)))
+            asyncio.create_task(player.sendChatMessage(
+                messages['greeting_message_members'].format(player=player, server=server)))
             autorole = server.locals.get('autorole', self.bot.locals.get('autorole', {}).get('online'))
             if autorole:
                 # noinspection PyAsyncCall
@@ -551,9 +590,7 @@ class MissionEventListener(EventListener):
                         return
                     if not player.member.voice:
                         # noinspection PyAsyncCall
-                        asyncio.create_task(server.kick(player, reason=server.locals.get(
-                            'message_no_voice', 'You need to be in voice channel "{}" to use this server!'
-                        ).format(voice.name)))
+                        asyncio.create_task(server.kick(player, reason=messages['message_no_voice'].format(voice.name)))
                         return
                     else:
                         # noinspection PyAsyncCall
@@ -570,11 +607,11 @@ class MissionEventListener(EventListener):
             autorole = server.locals.get('autorole', self.bot.locals.get('autorole', {}).get('online'))
             if autorole:
                 await player.remove_role(autorole)
-        # check if we've reached the max_threshold
-        config = self.get_config(server)
-        mt = config.get('usage_alarm', {}).get('min_threshold')
+        # check if we've reached the min_threshold
+        usage_alarm = server.locals.get('usage_alarm', {})
+        mt = usage_alarm.get('min_threshold')
         if mt and len(server.get_active_players()) == (mt - 1):
-            await self._threshold_alert(server, config['usage_alarm'])
+            await self._threshold_alert(server, usage_alarm)
         self.display_mission_embed(server)
         self.display_player_embed(server)
 
@@ -596,7 +633,7 @@ class MissionEventListener(EventListener):
             return
         try:
             self.send_dcs_event(server, player.side,
-                                self.EVENT_TEXTS[player.side]['disconnect'].format(player.name))
+                                self.EVENT_TEXTS[player.side]['disconnect'].format(player.name, server.name))
         finally:
             await self._stop_player(server, player)
 

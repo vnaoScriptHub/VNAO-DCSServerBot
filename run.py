@@ -14,7 +14,7 @@ from core import (
     NodeImpl, ServiceRegistry, ServiceInstallationError, utils, YAMLError, FatalException, COMMAND_LINE_ARGS,
     CloudRotatingFileHandler
 )
-from datetime import datetime, timezone
+from datetime import datetime
 from install import Install
 from migrate import migrate
 from pid import PidFile, PidFileError
@@ -22,8 +22,6 @@ from rich import print
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.text import Text
-
-from services import Dashboard
 
 # ruamel YAML support
 from ruamel.yaml import YAML
@@ -50,8 +48,7 @@ class Main:
     @staticmethod
     def setup_logging(node: str):
         def time_formatter(time: datetime, _: str = None) -> Text:
-            log_time = time.astimezone(timezone.utc)
-            return Text(log_time.strftime('%H:%M:%S'))
+            return Text(time.strftime('%H:%M:%S'))
 
         # Setup console logger
         ch = RichHandler(rich_tracebacks=True, tracebacks_suppress=[discord], log_time_format=time_formatter)
@@ -99,13 +96,13 @@ class Main:
         perf_logger.addHandler(pfh)
 
     @staticmethod
-    def reveal_passwords():
+    def reveal_passwords(config_dir: str):
         print("[yellow]These are your hidden secrets:[/]")
-        for file in utils.list_all_files(os.path.join('config', '.secret')):
+        for file in utils.list_all_files(os.path.join(config_dir, '.secret')):
             if not file.endswith('.pkl'):
                 continue
             key = file[:-4]
-            print(f"{key}: {utils.get_password(key)}")
+            print(f"{key}: {utils.get_password(key, config_dir)}")
         print("\n[red]DO NOT SHARE THESE SECRET KEYS![/]")
 
     async def run(self):
@@ -133,26 +130,17 @@ class Main:
         async with ServiceRegistry(node=self.node) as registry:
             if registry.services():
                 self.log.info("- Loading Services ...")
-            for cls in registry.services().keys():
-                if not registry.can_run(cls):
-                    continue
-                if cls == Dashboard:
-                    if self.node.config.get('use_dashboard', True):
-                        self.log.info("  => Dashboard started.")
-                        dashboard = registry.new(Dashboard)
-                        # noinspection PyAsyncCall
-                        asyncio.create_task(dashboard.start())
-                    continue
+            services = [registry.new(cls) for cls in registry.services().keys() if registry.can_run(cls)]
+            ret = await asyncio.gather(*[service.start() for service in services], return_exceptions=True)
+            for idx in range(0, len(ret)):
+                name = services[idx].name
+                if isinstance(ret[idx], (ServiceInstallationError, FatalException)):
+                    self.log.error(f"  - {ret[idx].__str__()}")
+                    self.log.error(f"  => Service {name} NOT started.")
+                    if isinstance(ret[idx], FatalException):
+                        return
                 else:
-                    try:
-                        # noinspection PyAsyncCall
-                        asyncio.create_task(registry.new(cls).start())
-                        self.log.debug(f"  => {cls.__name__} loaded.")
-                    except ServiceInstallationError as ex:
-                        self.log.error(f"  - {ex.__str__()}")
-                        self.log.info(f"  => {cls.__name__} NOT loaded.")
-                    except Exception as ex:
-                        self.log.exception(ex)
+                    self.log.debug(f"  => Service {name} started.")
             if not self.node.master:
                 self.log.info("DCSServerBot AGENT started.")
             try:
@@ -166,36 +154,26 @@ class Main:
                     self.node.master = not self.node.master
                     if self.node.master:
                         self.log.info("Taking over the Master node ...")
-                        if self.node.config.get('use_dashboard', True):
-                            await dashboard.stop()
                         for cls in registry.services().keys():
                             if registry.master_only(cls):
                                 try:
-                                    # noinspection PyAsyncCall
-                                    asyncio.create_task(registry.new(cls).start())
+                                    await registry.new(cls).start()
                                 except ServiceInstallationError as ex:
                                     self.log.error(f"  - {ex.__str__()}")
-                                    self.log.info(f"  => {cls.__name__} NOT loaded.")
+                                    self.log.error(f"  => {cls.__name__} NOT loaded.")
                             else:
                                 service = registry.get(cls)
                                 if service:
-                                    # noinspection PyAsyncCall
-                                    asyncio.create_task(service.switch())
+                                    await service.switch()
                     else:
                         self.log.info("Second Master found, stepping back to Agent configuration.")
-                        if self.node.config.get('use_dashboard', True):
-                            await dashboard.stop()
                         for cls in registry.services().keys():
                             if registry.master_only(cls):
-                                # noinspection PyAsyncCall
-                                asyncio.create_task(registry.get(cls).stop())
+                                await registry.get(cls).stop()
                             else:
                                 service = registry.get(cls)
                                 if service:
-                                    # noinspection PyAsyncCall
-                                    asyncio.create_task(service.switch())
-                    if self.node.config.get('use_dashboard', True):
-                        await dashboard.start()
+                                    await service.switch()
                     self.log.info(f"I am the {'Master' if self.node.master else 'Agent'} now.")
             except Exception as ex:
                 self.log.exception(ex)
@@ -205,9 +183,10 @@ class Main:
                 await self.node.unregister()
 
 
-async def run_node(name, config_dir=None, no_autoupdate=False):
+async def run_node(name, config_dir=None, no_autoupdate=False) -> int:
     async with NodeImpl(name=name, config_dir=config_dir) as node:
         await Main(node, no_autoupdate=no_autoupdate).run()
+        return node.rc
 
 
 if __name__ == "__main__":
@@ -226,9 +205,9 @@ if __name__ == "__main__":
     Main.setup_logging(args.node)
     log = logging.getLogger("dcsserverbot")
     # check if we should reveal the passwords
-    utils.create_secret_dir()
+    utils.create_secret_dir(args.config)
     if args.secret:
-        Main.reveal_passwords()
+        Main.reveal_passwords(args.config)
         exit(-2)
 
     # Check versions
@@ -244,10 +223,10 @@ if __name__ == "__main__":
     try:
         with PidFile(pidname=f"dcssb_{args.node}", piddir='.'):
             try:
-                asyncio.run(run_node(name=args.node, config_dir=args.config, no_autoupdate=args.noupdate))
+                rc = asyncio.run(run_node(name=args.node, config_dir=args.config, no_autoupdate=args.noupdate))
             except FatalException:
                 Install(node=args.node).install(config_dir=args.config, user='dcsserverbot', database='dcsserverbot')
-                asyncio.run(run_node(name=args.node, no_autoupdate=args.noupdate))
+                rc = asyncio.run(run_node(name=args.node, config_dir=args.config, no_autoupdate=args.noupdate))
     except PermissionError:
         # do not restart again
         log.error("There is a permission error.")
@@ -280,3 +259,4 @@ if __name__ == "__main__":
         console.print_exception(show_locals=True, max_frames=1)
         # restart on unknown errors
         exit(-1)
+    exit(rc)

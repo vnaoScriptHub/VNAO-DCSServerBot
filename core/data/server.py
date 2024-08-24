@@ -28,7 +28,7 @@ yaml = YAML()
 
 if TYPE_CHECKING:
     from core import Extension, Instance, Mission, UploadStatus, Player
-    from services import ServiceBus
+    from services.servicebus import ServiceBus
 
 __all__ = ["Server"]
 
@@ -63,7 +63,7 @@ class Server(DataObject):
     restart_time: datetime = field(compare=False, default=None)
 
     def __post_init__(self):
-        from services import ServiceBus
+        from services.servicebus import ServiceBus
 
         super().__post_init__()
         self.bus = ServiceRegistry.get(ServiceBus)
@@ -86,13 +86,16 @@ class Server(DataObject):
                 data = yaml.load(Path(config_file).read_text(encoding='utf-8'))
             except MarkedYAMLError as ex:
                 raise YAMLError(config_file, ex)
-            if not data.get(self.name) and self.name != 'n/a':
+            if data.get(self.name) is None and self.name != 'n/a':
                 self.log.warning(f'No configuration found for server "{self.name}" in servers.yaml!')
             _locals = data.get(DEFAULT_TAG, {}) | data.get(self.name, {})
-            if 'message_ban' not in _locals:
-                _locals['message_ban'] = _('You are banned from this server. Reason: {}')
-            if 'message_server_full' not in _locals:
-                _locals['message_server_full'] = _('The server is full, please try again later.')
+            _locals['messages'] = {
+                "greeting_message_members": "{player.name}, welcome back to {server.name}!",
+                "greeting_message_unmatched": "{player.name}, please use /linkme in our Discord, if you want to see your user stats!",
+                "message_ban": "You are banned from this server. Reason: {}",
+                "message_reserved": "This server is locked for specific users.\nPlease contact a server admin.",
+                "message_no_voice": 'You need to be in voice channel "{}" to use this server!'
+            } | _locals.get('messages', {})
             return _locals
         return {}
 
@@ -418,7 +421,7 @@ class Server(DataObject):
             await self.wait_for_status_change([Status.STOPPED, Status.SHUTDOWN], timeout)
         self.current_mission = None
 
-    async def init_extensions(self):
+    async def init_extensions(self) -> list[str]:
         raise NotImplemented()
 
     async def prepare_extensions(self):
@@ -434,4 +437,13 @@ class Server(DataObject):
         raise NotImplemented()
 
     async def run_on_extension(self, extension: str, method: str, **kwargs) -> Any:
+        raise NotImplemented()
+
+    async def config_extension(self, name: str, config: dict) -> None:
+        raise NotImplemented()
+
+    async def install_extension(self, name: str, config: dict) -> None:
+        raise NotImplemented()
+
+    async def uninstall_extension(self, name: str) -> None:
         raise NotImplemented()

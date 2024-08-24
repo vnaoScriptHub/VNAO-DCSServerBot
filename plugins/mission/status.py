@@ -1,8 +1,9 @@
 import asyncio
+from zoneinfo import ZoneInfo
 
 from core import const, report, Status, Server, utils, ServiceRegistry, Plugin, Side
 from datetime import datetime, timedelta, timezone
-from services import BotService
+from services.bot import BotService
 from typing import Optional, cast
 
 STATUS_IMG = {
@@ -25,7 +26,7 @@ class Init(report.EmbedElement):
     async def render(self, server: Server):
         num_players = len(server.get_active_players()) + 1
         self.embed.set_author(
-            name=f"{server.name} [{num_players}/{server.settings['maxPlayers']}]",
+            name=f"{server.name} [{num_players}/{server.settings.get('maxPlayers', 16)}]",
             icon_url=STATUS_IMG[server.status])
         if server.status in [Status.PAUSED, Status.RUNNING] and server.current_mission:
             self.embed.description = f"Mission: \"{server.current_mission.display_name}\""
@@ -151,11 +152,14 @@ class ScheduleInfo(report.EmbedElement):
             config = scheduler.get_config(server)
             if 'schedule' in config:
                 await report.Ruler(self.env).render(text="This server runs on the following schedule:")
-                utc_diff = utils.get_utc_offset()
-                self.add_field(name=f'Time (UTC{utc_diff})', value='\n'.join(config['schedule'].keys()))
                 value = ''
-                for schedule in config['schedule'].values():
-                    for c in schedule:
+                now = datetime.now()
+                tz = now.astimezone().tzinfo
+                for period, daystate in config['schedule'].items():
+                    if period == 'timezone':
+                        tz = ZoneInfo(daystate)
+                        continue
+                    for c in daystate:
                         if c == 'Y':
                             value += '✅|'
                         elif c == 'N':
@@ -163,6 +167,15 @@ class ScheduleInfo(report.EmbedElement):
                         elif c == 'P':
                             value += '☑️|'
                     value += '\n'
+                now = now.replace(tzinfo=tz)
+                hours, rem = divmod(tz.utcoffset(now).total_seconds(), 3600)
+                minutes, _ = divmod(rem, 60)
+                if hours > 0 or minutes > 0:
+                    sign = '+' if hours >= 0 else '-'
+                    name = f'Time (UTC{sign}{int(abs(hours)):02d}:{int(minutes):02d})'
+                else:
+                    name = 'Time (UTC)'
+                self.add_field(name=name, value='\n'.join([x for x in config['schedule'].keys() if x != 'timezone']))
                 self.add_field(name='🇲|🇹|🇼|🇹|🇫|🇸|🇸', value=value)
                 self.add_field(name='_ _', value='✅ = Server running\n'
                                                  '❌ = Server not running\n'
@@ -176,7 +189,7 @@ class Footer(report.EmbedElement):
         for listener in self.bot.eventListeners:
             # noinspection PyUnresolvedReferences
             if (type(listener).__name__ == 'UserStatisticsEventListener') and \
-                    (server.name in listener.statistics):
+                    (server.name in listener.active_servers):
                 text += '\n\nUser statistics are enabled for this server.'
                 break
         text += f'\n\nLast updated: {datetime.now(timezone.utc):%y-%m-%d %H:%M:%S UTC}'

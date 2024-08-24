@@ -15,9 +15,10 @@ from core import Plugin, utils, TEventListener, PaginationReport, Group, DEFAULT
 from discord import app_commands
 from discord.ext import commands, tasks
 from psycopg.rows import dict_row
+from services.bot import DCSServerBot
+from services.bot.dummy import DummyBot
 from typing import Type, Any, Optional, Union
 
-from services import DCSServerBot
 from .listener import CloudListener
 from .logger import CloudLoggingHandler
 
@@ -228,7 +229,7 @@ class Cloud(Plugin):
                 await self.bus.unban(ucid)
         if self.config.get('discord-ban', False):
             bans: dict = await self.get('discord-bans')
-            users_to_ban = {await self.bot.fetch_user(x['discord_id']) for x in bans}
+            users_to_ban = {user for ban in bans if (user := await self.bot.fetch_user(ban['discord_id'])) is not None}
             guild = self.bot.guilds[0]
             guild_bans = [entry async for entry in guild.bans()]
             banned_users = {x.user for x in guild_bans if x.reason and x.reason.startswith('DGSA:')}
@@ -298,8 +299,9 @@ class Cloud(Plugin):
             # noinspection PyUnresolvedReferences
             bot = {
                 "guild_id": self.bot.guilds[0].id,
+                "guild_name": self.bot.guilds[0].name,
                 "bot_version": f"{self.bot.version}.{self.bot.sub_version}",
-                "variant": "DCSServerBot",
+                "variant": "DCSServerBot" if not isinstance(self.bot, DummyBot) else "No Bot",
                 "dcs_version": dcs_version,
                 "python_version": '.'.join(platform.python_version_tuple()),
                 "num_bots": num_bots,

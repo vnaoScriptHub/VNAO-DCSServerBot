@@ -9,7 +9,7 @@ from core import Status, utils
 from datetime import datetime
 from discord import app_commands, Interaction, SelectOption
 from discord.ext import commands
-from discord.ui import Button, View, Select, Item
+from discord.ui import Button, View, Select, Item, Modal, TextInput
 from enum import Enum, auto
 from fuzzywuzzy import fuzz
 from io import BytesIO
@@ -20,7 +20,8 @@ from .helper import get_all_players, is_ucid, format_string
 
 if TYPE_CHECKING:
     from core import Server, Player, Node, Instance, Plugin, Command
-    from services import DCSServerBot, ServiceBus
+    from services.bot import DCSServerBot
+    from services.servicebus import ServiceBus
 
 
 __all__ = [
@@ -60,7 +61,8 @@ __all__ = [
     "get_squadron",
     "server_selection",
     "get_ephemeral",
-    "get_command"
+    "get_command",
+    "ConfigModal"
 ]
 
 
@@ -735,7 +737,7 @@ def create_warning_embed(title: str, text: Optional[str] = None,
     embed = discord.Embed(title=title, color=discord.Color.yellow())
     if text:
         embed.description = text
-    with open("images/warning.png", mode="rb") as img:
+    with open(os.path.join('images', 'warning.png'), mode="rb") as img:
         img_bytes = img.read()
     buffer = BytesIO(img_bytes)
     file = discord.File(fp=buffer, filename="warning.png")
@@ -910,7 +912,7 @@ class NodeTransformer(app_commands.Transformer):
     """
     async def transform(self, interaction: discord.Interaction, value: Optional[str]) -> Node:
         if value:
-            return next(x.node for x in interaction.client.servers.values() if x.node.name == value)
+            return next((x.node for x in interaction.client.servers.values() if x.node.name == value), None)
         else:
             return interaction.client.node
 
@@ -943,7 +945,7 @@ class InstanceTransformer(app_commands.Transformer):
             node: Node = await NodeTransformer().transform(interaction, get_interaction_param(interaction, 'node'))
             if not node:
                 return None
-            return next(x for x in node.instances if x.name == value)
+            return next((x for x in node.instances if x.name == value), None)
         elif len(interaction.client.node.instances) == 1:
             return interaction.client.node.instances[0]
         else:
@@ -1214,3 +1216,52 @@ async def get_command(bot: DCSServerBot, *, name: str,
                     return inner
         elif cmd.name == name:
             return cmd
+
+
+class ConfigModal(Modal):
+    def __init__(self, title: str, config: dict, default: Optional[dict] = None, ephemeral: Optional[bool] = False):
+        super().__init__(title=title)
+        self.ephemeral = ephemeral
+        self.value = None
+        self.config = config
+        if not default:
+            default = {}
+        for k, v in self.config.items():
+            self.add_item(TextInput(custom_id=k,
+                                    label=v.get('label'),
+                                    style=discord.TextStyle(v.get('style', 1)),
+                                    placeholder=v.get('placeholder'),
+                                    default=str(default.get(k) or ""),
+                                    required=v.get('required', False),
+                                    min_length=v.get('min_length'),
+                                    max_length=v.get('max_length')))
+
+    @staticmethod
+    def unmap(value: str, t: str = None) -> Any:
+        if not t:
+            return value
+        elif t == int:
+            return int(value)
+        elif t == float:
+            return float(value)
+        elif t == bool:
+            if value.lower() == 'true':
+                return True
+            elif value.lower() == 'false':
+                return False
+            else:
+                raise ValueError(f"{value} is not a boolean!")
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # noinspection PyUnresolvedReferences
+        await interaction.response.defer(ephemeral=self.ephemeral)
+        self.value = {
+            v.custom_id: self.unmap(v.value, self.config[v.custom_id].get('type')) if v.value else v.default
+            for v in self.children
+        }
+        self.stop()
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        # noinspection PyUnresolvedReferences
+        await interaction.response.send_message(f"An error occurred: {error}")
+        self.stop()

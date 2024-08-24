@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import logging
 import os
 import psutil
+import shutil
 import sys
 
 if sys.platform == 'win32':
@@ -14,7 +16,7 @@ if sys.platform == 'win32':
 from datetime import datetime, timezone
 from discord.ext import tasks
 
-from core import Status, Server, ServerImpl, Autoexec
+from core import Status, Server, ServerImpl, Autoexec, utils
 from core.services.base import Service
 from core.services.registry import ServiceRegistry
 
@@ -35,13 +37,47 @@ class MonitoringService(Service):
         self.bus = ServiceRegistry.get(ServiceBus)
         self.io_counters = {}
         self.net_io_counters = None
+        self.space_warning_sent: dict[str, bool] = {}
+        self.space_alert_sent: dict[str, bool] = {}
 
     async def start(self):
         await super().start()
+        install_drive = os.path.splitdrive(os.path.expandvars(self.node.locals['DCS']['installation']))[0]
+        self.space_warning_sent[install_drive] = False
+        self.space_alert_sent[install_drive] = False
+        if install_drive != 'C:':
+            self.space_warning_sent['C:'] = False
+            self.space_alert_sent['C:'] = False
         self.check_autoexec()
         self.monitoring.start()
+        if self.get_config().get('time_sync', False):
+            time_server = self.get_config().get('time_server', None)
+            if time_server:
+                if sys.platform == 'win32':
+                    try:
+                        retval = ctypes.windll.shell32.ShellExecuteW(
+                            None,
+                            "runas", 'w32tm', f'/config /manualpeerlist:{time_server} /syncfromflags:MANUAL',
+                            None, 1
+                        )
+                        if retval > 31:
+                            self.log.info(f"- Time server configured as {time_server}.")
+                        else:
+                            self.log.info(f"- Could not configure time server, errorcode: {retval}")
+                    except OSError as ex:
+                        if ex.winerror == 740:
+                            self.log.error("You need to disable User Access Control (UAC), "
+                                           "to use the automated time sync.")
+                        raise
+                else:
+                    # not implemented for UNIX
+                    pass
+
+            self.time_sync.start()
 
     async def stop(self):
+        if self.get_config().get('time_sync', False):
+            self.time_sync.cancel()
         self.monitoring.cancel()
         await super().stop()
 
@@ -59,19 +95,26 @@ class MonitoringService(Service):
             except Exception as ex:
                 self.log.error(f"  => Error while parsing autoexec.cfg: {ex.__repr__()}")
 
-    async def warn_admins(self, server: Server, title: str, message: str) -> None:
-        message += f"\nLatest dcs-<timestamp>.log can be pulled with /download\n" \
-                   f"If the scheduler is configured for this server, it will relaunch it automatically."
+    async def send_alert(self, title: str, message: str, **kwargs):
+        params = {
+            "title": title,
+            "message": message
+        }
+        if 'server' in kwargs:
+            params['server'] = kwargs['server'].name
+        else:
+            params['node'] = self.node.name
         await self.bus.send_to_node({
             "command": "rpc",
             "service": BotService.__name__,
             "method": "alert",
-            "params": {
-                "server": server.name,
-                "title": title,
-                "message": message
-            }
+            "params": params
         })
+
+    async def warn_admins(self, server: Server, title: str, message: str) -> None:
+        message += f"\nLatest dcs-<timestamp>.log can be pulled with /download\n" \
+                   f"If the scheduler is configured for this server, it will relaunch it automatically."
+        await self.send_alert(title, message, server=server)
 
     async def check_popups(self):
         # check for blocked processes due to window popups
@@ -96,18 +139,21 @@ class MonitoringService(Service):
                    f"{int(server.instance.locals.get('max_hung_minutes', 3))} minutes. Killing ...")
         self.log.warning(message)
         if server.process and server.process.is_running():
+            now = datetime.now(timezone.utc)
             if sys.platform == 'win32':
                 try:
-                    now = datetime.now(timezone.utc)
                     filename = os.path.join(server.instance.home, 'Logs',
                                             f"{now.strftime('dcs-%Y%m%d-%H%M%S')}.dmp")
                     await asyncio.to_thread(create_dump, server.process.pid, filename,
                                             MINIDUMP_TYPE.MiniDumpNormal, True)
+
                     root = logging.getLogger()
                     if root.handlers:
                         root.removeHandler(root.handlers[0])
                 except OSError:
                     self.log.debug("No minidump created due to an error (Linux?).")
+            shutil.copy2(os.path.join(server.instance.home, 'Logs', 'dcs.log'),
+                         os.path.join(server.instance.home, 'Logs', f"dcs-{now.strftime('%Y%m%d-%H%M%S')}.log"))
             server.process.kill()
         else:
             await server.shutdown(True)
@@ -166,8 +212,9 @@ class MonitoringService(Service):
         async with self.apool.connection() as conn:
             async with conn.transaction():
                 await conn.execute("""
-                    INSERT INTO nodestats (node, pool_available, requests_queued, requests_wait_ms, dcs_queue, 
-                    asyncio_queue)
+                    INSERT INTO nodestats (
+                        node, pool_available, requests_queued, requests_wait_ms, dcs_queue, asyncio_queue
+                    )
                     VALUES (%s, %s, %s, %s, %s, %s)
                 """, (self.node.name, pstats.get('pool_available', 0), pstats.get('requests_queued', 0),
                       pstats.get('requests_wait_ms', 0), sum(x.qsize() for x in bus.udp_server.message_queue.values()),
@@ -204,7 +251,7 @@ class MonitoringService(Service):
         }
 
     async def serverload(self):
-        for server in self.bus.servers.copy().values():
+        for server in self.bus.servers.values():
             if server.is_remote or server.status not in [Status.RUNNING, Status.PAUSED]:
                 continue
             if not server.process:
@@ -222,6 +269,21 @@ class MonitoringService(Service):
             if sys.platform == 'win32':
                 await self.check_popups()
             await self.heartbeat()
+            for drive in self.space_warning_sent.keys():
+                total, free = utils.get_drive_space(drive)
+                warn_pct = (self.get_config().get('drive_warn_threshold', 10)) / 100
+                alert_pct = (self.get_config().get('drive_alert_threshold', 5)) / 100
+                if (free < total * warn_pct) and not self.space_warning_sent[drive]:
+                    message = f"Your freespace on {drive} is below {warn_pct * 100}%!"
+                    self.log.warning(message)
+                    await self.node.audit(message)
+                    self.space_warning_sent[drive] = True
+                if (free < total * alert_pct) and not self.space_alert_sent[drive]:
+                    message = f"Your freespace on {drive} is below {alert_pct * 100}%!"
+                    self.log.error(message)
+                    await self.send_alert(title=f"Your DCS drive on node {self.node.name} is running out of space!",
+                                          message=message)
+                    self.space_alert_sent[drive] = True
             if 'serverstats' in self.node.config.get('opt_plugins', []):
                 await self.serverload()
             if self.node.locals.get('nodestats', True):
@@ -234,3 +296,21 @@ class MonitoringService(Service):
         if self.node.master:
             bot = ServiceRegistry.get(BotService).bot
             await bot.wait_until_ready()
+
+    @tasks.loop(hours=12)
+    async def time_sync(self):
+        if sys.platform == 'win32':
+            try:
+                retval = ctypes.windll.shell32.ShellExecuteW(None, "runas", 'w32tm', '/resync', None, 1)
+                if retval > 31:
+                    self.log.info("- Windows time synced.")
+                else:
+                    self.log.info(f"- Windows time NOT synced, errorcode: {retval}")
+            except OSError as ex:
+                if ex.winerror == 740:
+                    self.log.error("You need to disable User Access Control (UAC), "
+                                   "to use the automated time sync.")
+                raise
+        else:
+            # not implemented for UNIX
+            pass

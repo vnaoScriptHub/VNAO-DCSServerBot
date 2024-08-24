@@ -15,7 +15,7 @@ import secrets
 import shutil
 import string
 import tempfile
-import time
+import threading
 import unicodedata
 
 # for eval
@@ -23,7 +23,7 @@ import random
 import math
 
 from croniter import croniter
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from importlib import import_module
 from pathlib import Path
 from typing import Optional, Union, TYPE_CHECKING, Generator, Iterable
@@ -47,7 +47,6 @@ __all__ = [
     "sanitize_string",
     "convert_time",
     "format_time",
-    "get_utc_offset",
     "format_period",
     "slugify",
     "alternate_parse_settings",
@@ -59,6 +58,7 @@ __all__ = [
     "is_github_repo",
     "matches_cron",
     "dynamic_import",
+    "ThreadSafeDict",
     "SettingsDict",
     "RemoteSettingsDict",
     "tree_delete",
@@ -71,13 +71,16 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-def parse_time(time_str: str) -> datetime:
+def parse_time(time_str: str, tz: datetime.tzinfo = None) -> datetime:
     fmt, time_str = ('%H:%M', time_str.replace('24:', '00:')) \
         if time_str.find(':') > -1 else ('%H', time_str.replace('24', '00'))
-    return datetime.strptime(time_str, fmt)
+    ret = datetime.strptime(time_str, fmt)
+    if tz is not None:
+        ret = ret.replace(tzinfo=tz)
+    return ret
 
 
-def is_in_timeframe(time: datetime, timeframe: str) -> bool:
+def is_in_timeframe(time: datetime, timeframe: str, tz: datetime.tzinfo = None) -> bool:
     """
     Check if a given time falls within a specified timeframe.
 
@@ -85,18 +88,23 @@ def is_in_timeframe(time: datetime, timeframe: str) -> bool:
     :type time: datetime
     :param timeframe: The timeframe to check against. Format: 'HH:MM-HH:MM' or 'HH:MM'.
     :type timeframe: str
+    :param tz: timezone to be used
+    :type tz: datetime.tzinfo
     :return: True if the time falls within the timeframe, False otherwise.
     :rtype: bool
     """
     pos = timeframe.find('-')
     if pos != -1:
-        start_time = parse_time(timeframe[:pos])
-        end_time = parse_time(timeframe[pos + 1:])
+        start_time = parse_time(timeframe[:pos], tz).replace(year=time.year, month=time.month, day=time.day,
+                                                             second=0, microsecond=0)
+        end_time = parse_time(timeframe[pos + 1:], tz).replace(year=time.year, month=time.month, day=time.day,
+                                                               second=0, microsecond=0)
         if end_time <= start_time:
             end_time += timedelta(days=1)
     else:
-        start_time = end_time = parse_time(timeframe)
-    check_time = time.replace(year=start_time.year, month=start_time.month, day=start_time.day, second=0, microsecond=0)
+        start_time = end_time = parse_time(timeframe, tz).replace(year=time.year, month=time.month, day=time.day,
+                                                                  second=0, microsecond=0)
+    check_time = time.replace(second=0, microsecond=0)
     return start_time <= check_time <= end_time
 
 
@@ -228,34 +236,6 @@ def format_time(seconds: int):
     :return: The formatted time string in HH:MM:SS format.
     """
     return convert_time_and_format(int(seconds), False)
-
-
-def get_utc_offset() -> str:
-    """
-    Return the UTC offset of the current local time in the format HH:MM.
-
-    :return: The UTC offset in the format HH:MM.
-    :rtype: str
-    """
-    # Get the struct_time objects for the current local time and UTC time
-    current_time = time.time()
-    localtime = time.localtime(current_time)
-    gmtime = time.gmtime(current_time)
-
-    # Convert these to datetime objects
-    local_dt = datetime(*localtime[:6], tzinfo=timezone.utc)
-    utc_dt = datetime(*gmtime[:6], tzinfo=timezone.utc)
-
-    # Compute the UTC offset
-    offset = local_dt - utc_dt
-
-    # Express the offset in hours:minutes
-    offset_minutes = int(offset.total_seconds() / 60)
-    offset_hours = offset_minutes // 60
-    offset_minutes %= 60
-    if offset.total_seconds() == 0:
-        return ""
-    return f"{offset_hours:+03d}:{offset_minutes:02d}"
 
 
 def format_period(period: str) -> str:
@@ -464,6 +444,57 @@ def dynamic_import(package_name: str):
             globals()[module_name] = importlib.import_module(f"{package_name}.{module_name}")
 
 
+class ThreadSafeDict(dict):
+    def __init__(self, *args, **kwargs):
+        self.lock = threading.Lock()
+        super(ThreadSafeDict, self).__init__(*args, **kwargs)
+
+    def __getitem__(self, key):
+        with self.lock:
+            return super(ThreadSafeDict, self).__getitem__(key)
+
+    def __setitem__(self, key, value):
+        with self.lock:
+            return super(ThreadSafeDict, self).__setitem__(key, value)
+
+    def __delitem__(self, key):
+        with self.lock:
+            return super(ThreadSafeDict, self).__delitem__(key)
+
+    def __iter__(self):
+        with self.lock:
+            for key in dict.keys(self):
+                yield key, dict.__getitem__(self, key)
+
+    def items(self):
+        with self.lock:
+            return list(super().items())
+
+    def values(self):
+        with self.lock:
+            return list(super().values())
+
+    def keys(self):
+        with self.lock:
+            return list(super().keys())
+
+    def get(self, key, default=None):
+        with self.lock:
+            return super().get(key, default)
+
+    def pop(self, key, *default):
+        with self.lock:
+            return super().pop(key, *default)
+
+    def update(self, *args, **kwargs):
+        with self.lock:
+            return super().update(*args, **kwargs)
+
+    def clear(self):
+        with self.lock:
+            super().clear()
+
+
 class SettingsDict(dict):
     """
     A dictionary subclass that represents settings stored in a file.
@@ -486,9 +517,6 @@ class SettingsDict(dict):
 
     def read_file(self):
         if not os.path.exists(self.path):
-            self.log.error(f"- File {self.path} does not exist! Creating an empty file.")
-            with open(self.path, mode='w', encoding='utf-8') as f:
-                f.write(f"{self.root} = {{}}")
             return
         self.mtime = os.path.getmtime(self.path)
         if self.path.lower().endswith('.lua'):
@@ -517,14 +545,21 @@ class SettingsDict(dict):
             with open(tmpname, mode='wb') as outfile:
                 outfile.write((f"{self.root} = " + luadata.serialize(self, indent='\t',
                                                                      indent_level=0)).encode('utf-8'))
-        elif self.path.lower().endswith('.json'):
+        elif self.path.lower().endswith('.yaml'):
             with open(tmpname, mode="w", encoding='utf-8') as outfile:
                 yaml.dump(self, outfile)
-        shutil.copy2(tmpname, self.path)
-        self.mtime = os.path.getmtime(self.path)
+        if not os.path.exists(self.path):
+            self.log.info(f"- Creating {self.path} as it did not exist yet.")
+        try:
+            shutil.copy2(tmpname, self.path)
+            self.mtime = os.path.getmtime(self.path)
+        except Exception as ex:
+            self.log.exception(ex)
+        finally:
+            os.remove(tmpname)
 
     def __setitem__(self, key, value):
-        if self.mtime < os.path.getmtime(self.path):
+        if os.path.exists(self.path) and self.mtime < os.path.getmtime(self.path):
             self.log.debug(f'{self.path} changed, re-reading from disk.')
             self.read_file()
         super().__setitem__(key, value)
@@ -534,30 +569,52 @@ class SettingsDict(dict):
             self.log.error("- Writing of {} aborted due to empty set.".format(os.path.basename(self.path)))
 
     def __getitem__(self, item):
-        if self.mtime < os.path.getmtime(self.path):
+        if os.path.exists(self.path) and self.mtime < os.path.getmtime(self.path):
             self.log.debug(f'{self.path} changed, re-reading from disk.')
             self.read_file()
         return super().__getitem__(item)
 
+    def __delitem__(self, key):
+        if os.path.exists(self.path) and self.mtime < os.path.getmtime(self.path):
+            self.log.debug(f'{self.path} changed, re-reading from disk.')
+            self.read_file()
+        super().__delitem__(key)
+        if len(self):
+            self.write_file()
+        else:
+            self.log.error("- Writing of {} aborted due to empty set.".format(os.path.basename(self.path)))
+
+    def get(self, key, default=None):
+        try:
+            return self.__getitem__(key)
+        except KeyError:
+            return default
+
+    def pop(self, key, *default):
+        try:
+            value = self.__getitem__(key)
+            self.__delitem__(key)
+        except KeyError:
+            if default:
+                return default[0]
+            else:
+                raise
+        return value
+
 
 class RemoteSettingsDict(dict):
-    """
-    A dictionary subclass that allows remote access to settings on a server.
+    """A dictionary-like class for managing remote settings.
+
+    This class inherits from the built-in dict class and provides additional functionality for managing settings on a remote server.
 
     Args:
-        server (ServerProxy): The server proxy object used to communicate with the server.
-        obj (str): The name of the object containing the settings.
-        data (dict, optional): The initial data to populate the dictionary with. Defaults to None.
+        server (ServerProxy): The server proxy object that handles communication with the remote server.
+        obj (str): The name of the object on the remote server that the settings belong to.
+        data (Optional[dict]): Optional initial data for the settings dictionary.
 
     Attributes:
-        server (ServerProxy): The server proxy object used to communicate with the server.
-        obj (str): The name of the object containing the settings.
-
-    Raises:
-        None
-
-    Returns:
-        None
+        server (ServerProxy): The server proxy object that handles communication with the remote server.
+        obj (str): The name of the object on the remote server that the settings belong to.
 
     """
     def __init__(self, server: ServerProxy, obj: str, data: Optional[dict] = None):
@@ -571,10 +628,24 @@ class RemoteSettingsDict(dict):
         msg = {
             "command": "rpc",
             "object": "Server",
-            "method": "_settings.__setitem__",
+            "server_name": self.server.name,
+            "method": f"{self.obj}.__setitem__",
             "params": {
                 "key": key,
                 "value": value
+            }
+        }
+        asyncio.create_task(self.server.send_to_dcs(msg))
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        msg = {
+            "command": "rpc",
+            "object": "Server",
+            "server_name": self.server.name,
+            "method": f"{self.obj}.__delitem__",
+            "params": {
+                "key": key
             }
         }
         asyncio.create_task(self.server.send_to_dcs(msg))
@@ -634,7 +705,6 @@ def evaluate(value: Union[str, int, float, bool, list, dict], **kwargs) -> Union
     """
     Evaluate the given value, replacing placeholders with keyword arguments if necessary.
 
-    :param debug: enable debug mode
     :param value: The value to evaluate. Can be a string, integer, float, or boolean.
     :param kwargs: Additional keyword arguments to replace placeholders in the value.
     :return: The evaluated value. Returns the input value if it is not a string or if it does not start with '$'.
@@ -644,7 +714,8 @@ def evaluate(value: Union[str, int, float, bool, list, dict], **kwargs) -> Union
         if isinstance(value, (int, float, bool)) or not value.startswith('$'):
             return value
         value = format_string(value[1:], **kwargs)
-        return eval(value) if value else False
+        namespace = {k: v for k, v in globals().items() if not k.startswith("__")}
+        return eval(value, namespace, kwargs) if value else False
 
     if isinstance(value, list):
         for i in range(len(value)):

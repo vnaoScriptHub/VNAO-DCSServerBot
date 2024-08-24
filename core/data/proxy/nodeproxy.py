@@ -20,7 +20,7 @@ __all__ = ["NodeProxy"]
 
 class NodeProxy(Node):
     def __init__(self, local_node: "NodeImpl", name: str, public_ip: str):
-        from services import ServiceBus
+        from services.servicebus import ServiceBus
 
         super().__init__(name, local_node.config_dir)
         self.local_node = local_node
@@ -52,10 +52,6 @@ class NodeProxy(Node):
     def installation(self) -> str:
         raise NotImplemented()
 
-    @property
-    def extensions(self) -> dict:
-        raise NotImplemented()
-
     def read_locals(self) -> dict:
         _locals = dict()
         config_file = os.path.join(self.config_dir, 'nodes.yaml')
@@ -72,11 +68,14 @@ class NodeProxy(Node):
                     _locals[name] = element
         return _locals
 
-    async def shutdown(self):
+    async def shutdown(self, rc: int = -2):
         await self.bus.send_to_node({
             "command": "rpc",
             "object": "Node",
-            "method": "shutdown"
+            "method": "shutdown",
+            "params": {
+                "rc": rc
+            }
         }, node=self.name)
 
     async def restart(self):
@@ -256,7 +255,7 @@ class NodeProxy(Node):
             }
         }, node=self.name, timeout=timeout)
 
-    async def add_instance(self, name: str, *, template: Optional["Instance"] = None) -> "Instance":
+    async def add_instance(self, name: str, *, template: str = "") -> "Instance":
         timeout = 60 if not self.slow_system else 120
         data = await self.bus.send_to_node_sync({
             "command": "rpc",
@@ -264,7 +263,7 @@ class NodeProxy(Node):
             "method": "add_instance",
             "params": {
                 "name": name,
-                "template": template.name
+                "template": template
             }
         }, node=self.name, timeout=timeout)
         return InstanceProxy(name=data['return'], node=self)

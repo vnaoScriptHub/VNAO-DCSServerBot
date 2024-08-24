@@ -5,7 +5,7 @@ import discord
 import os
 import zipfile
 
-from core import utils
+from core import utils, FatalException, Node
 from core.services.base import Service
 from core.services.registry import ServiceRegistry
 from discord.ext import commands
@@ -13,9 +13,11 @@ from discord.utils import MISSING
 from io import BytesIO
 from matplotlib import font_manager
 from pathlib import Path
+from ssl import SSLCertVerificationError
 from typing import Optional, Union, TYPE_CHECKING
 
 from .dcsserverbot import DCSServerBot
+from .dummy import DummyBot
 
 # ruamel YAML support
 from ruamel.yaml import YAML
@@ -50,7 +52,7 @@ class BotService(Service):
         if not token:
             return False
         self.log.info("Discord TOKEN found, removing it from yaml ...")
-        utils.set_password('token', token)
+        utils.set_password('token', token, self.node.config_dir)
         return True
 
     def __init__(self, node):
@@ -63,8 +65,11 @@ class BotService(Service):
             self.save_config()
 
     @property
-    def token(self) -> str:
-        return utils.get_password('token')
+    def token(self) -> Optional[str]:
+        try:
+            return utils.get_password('token', self.node.config_dir)
+        except ValueError:
+            return None
 
     def init_bot(self):
         def get_prefix(client, message):
@@ -72,22 +77,30 @@ class BotService(Service):
             # Allow users to @mention the bot instead of using a prefix
             return commands.when_mentioned_or(*prefixes)(client, message)
 
-        # Create the Bot
-        return DCSServerBot(version=self.node.bot_version,
+        if self.locals.get('no_discord', False):
+            return DummyBot(version=self.node.bot_version,
                             sub_version=self.node.sub_version,
-                            command_prefix=get_prefix,
-                            description='Interact with DCS World servers',
-                            owner_id=self.locals['owner'],
-                            case_insensitive=True,
-                            intents=discord.Intents.all(),
                             node=self.node,
-                            locals=self.locals,
-                            help_command=None,
-                            heartbeat_timeout=120,
-                            assume_unsync_clock=True)
+                            locals=self.locals)
+        else:
+            # Create the Bot
+            return DCSServerBot(version=self.node.bot_version,
+                                sub_version=self.node.sub_version,
+                                command_prefix=get_prefix,
+                                description='Interact with DCS World servers',
+                                owner_id=self.locals['owner'],
+                                case_insensitive=True,
+                                intents=discord.Intents.all(),
+                                node=self.node,
+                                locals=self.locals,
+                                help_command=None,
+                                activity=discord.Game(
+                                    name=self.locals['discord_status']) if 'discord_status' in self.locals else None,
+                                heartbeat_timeout=120,
+                                assume_unsync_clock=True)
 
     async def start(self, *, reconnect: bool = True) -> None:
-        from services import ServiceBus
+        from services.servicebus import ServiceBus
 
         await super().start()
         try:
@@ -95,17 +108,19 @@ class BotService(Service):
                 await asyncio.sleep(1)
             self.bot = self.init_bot()
             await self.install_fonts()
-            async with self.bot:
-                await self.bot.start(self.token, reconnect=reconnect)
+            await self.bot.login(self.token)
+            # noinspection PyAsyncCall
+            asyncio.create_task(self.bot.connect(reconnect=reconnect))
+        except Exception as ex:
+            self.log.exception(ex)
         except PermissionError as ex:
             self.log.error("Please check the permissions for " + str(ex))
             raise
         except discord.HTTPException:
-            self.log.error("Error while logging in your Discord bot. Check you token!")
-            raise
-        except Exception as ex:
-            self.log.exception(ex)
-            raise
+            raise FatalException("Error while logging in your Discord bot. Check you token!")
+        except SSLCertVerificationError:
+            raise FatalException("The Discord certificate is invalid. You need to import it manually. "
+                                 "Check the known issues section in my Discord for help.")
 
     async def stop(self):
         if self.bot:
@@ -113,12 +128,12 @@ class BotService(Service):
         await super().stop()
 
     async def alert(self, title: str, message: str, server: Optional[Server] = None,
-                    node: Optional[str] = None) -> None:
+                    node: Optional[Node] = None) -> None:
         mentions = ''.join([self.bot.get_role(role).mention for role in self.bot.roles['Alert']])
         embed, file = utils.create_warning_embed(title=title, text=utils.escape_string(message))
         if not server and node:
             try:
-                server = next(server for server in self.bot.servers.values() if server.node.name == node)
+                server = next(server for server in self.bot.servers.values() if server.node.name == node.name)
             except StopIteration:
                 server = None
         if server:
@@ -144,26 +159,29 @@ class BotService(Service):
             font_manager.fontManager.addfont(f)
 
     async def send_message(self, channel: int, content: Optional[str] = None, server: Optional[Server] = None,
-                           filename: Optional[str] = None, embed: Optional[dict] = None):
+                           filename: Optional[str] = None, embed: Optional[dict] = None,
+                           mention: Optional[list] = None):
         _channel = self.bot.get_channel(channel)
         if not _channel:
             if channel != -1:
                 raise ValueError(f"Channel {channel} not found!")
             return
-        if embed:
-            _embed = discord.Embed.from_dict(embed)
-        else:
-            _embed = MISSING
+        _embed = discord.Embed.from_dict(embed) if embed else MISSING
         if filename:
             data = await server.node.read_file(filename)
             file = discord.File(BytesIO(data), filename=os.path.basename(filename))
         else:
             file = MISSING
+        if mention:
+            _mention = ""
+            for role in mention:
+                _mention += self.bot.get_role(role).mention
+            content = _mention + (content or '')
         await _channel.send(content=content, file=file, embed=_embed)
 
     async def audit(self, message, user: Optional[Union[discord.Member, str]] = None,
-                    server: Optional[Server] = None):
-        await self.bot.audit(message, user=user, server=server)
+                    server: Optional[Server] = None, **kwargs):
+        await self.bot.audit(message, user=user, server=server, **kwargs)
 
     async def rename_server(self, server: Server, new_name: str):
         async with self.apool.connection() as conn:

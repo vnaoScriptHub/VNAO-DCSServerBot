@@ -27,12 +27,12 @@ class SlotBlockingListener(EventListener):
                 'plugin': self.plugin_name,
                 'params': config
             })
-            guild = self.bot.guilds[0]
             roles = []
             for role in config.get('VIP', {}).get('discord', []):
                 roles.append(self.bot.get_role(role))
             if not roles:
                 return
+            guild = self.bot.guilds[0]
             # get all linked members
             async with self.apool.connection() as conn:
                 cursor = await conn.execute("""
@@ -76,8 +76,9 @@ class SlotBlockingListener(EventListener):
             is_unit_type = unit.get('unit_type') == player.unit_type
             is_unit_name = unit.get('unit_name') in player.unit_name
             is_group_name = unit.get('group_name') in player.group_name
+            side = unit.get('side', player.side) == player.side
 
-            if is_unit_type or is_unit_name or is_group_name:
+            if side and (is_unit_type or is_unit_name or is_group_name):
                 is_player_slot = player.sub_slot == 0 and 'points' in unit
                 is_crew_slot = player.sub_slot > 0 and 'crew' in unit
 

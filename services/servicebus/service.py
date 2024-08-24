@@ -9,7 +9,8 @@ from _operator import attrgetter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from copy import deepcopy
-from core import Server, Mission, Node, DataObjectFactory, Status, Autoexec, ServerProxy, utils, PubSub, PerformanceLog
+from core import Server, Mission, Node, DataObjectFactory, Status, Autoexec, ServerProxy, utils, PubSub, PerformanceLog, \
+    ThreadSafeDict
 from core.services.base import Service
 from core.services.registry import ServiceRegistry
 from core.data.impl.serverimpl import ServerImpl
@@ -41,14 +42,14 @@ class ServiceBus(Service):
         self.version = self.node.bot_version
         self.listeners: dict[str, asyncio.Future] = dict()
         self.eventListeners: list[EventListener] = []
-        self.servers: dict[str, Server] = dict()
+        self.servers: dict[str, Server] = ThreadSafeDict()
         self.udp_server = None
         self.executor = None
         if self.node.locals['DCS'].get('desanitize', True):
             if not self.node.locals['DCS'].get('cloud', False) or self.master:
                 utils.desanitize(self)
         self.loop = asyncio.get_event_loop()
-        db_pass = utils.get_password('database')
+        db_pass = utils.get_password('database', self.node.config_dir)
         # main.yaml database connection has priority for intercom
         url = self.node.config.get("database", self.node.locals.get('database'))['url'].replace('SECRET', db_pass)
         self.intercom_channel = PubSub(self.node, 'intercom', url, self.handle_rpc)
@@ -155,24 +156,25 @@ class ServiceBus(Service):
         self.log.debug(f'  - EventListener {type(listener).__name__} unregistered.')
 
     async def init_servers(self):
-        async with self.apool.connection() as conn:
-            for instance in self.node.instances:
-                try:
+        self.log.debug("- init_servers()")
+        for instance in self.node.instances:
+            try:
+                async with self.apool.connection() as conn:
                     cursor = await conn.execute("""
                         SELECT server_name FROM instances 
                         WHERE node=%s AND instance=%s AND server_name IS NOT NULL
                     """, (self.node.name, instance.name))
                     row = await cursor.fetchone()
-                    # was there a server bound to this instance?
-                    if row:
-                        server: ServerImpl = DataObjectFactory().new(
-                            ServerImpl, node=self.node, port=instance.bot_port, name=row[0])
-                        instance.server = server
-                        self.servers[server.name] = server
-                    else:
-                        self.log.warning(f"There is no server bound to instance {instance.name}!")
-                except Exception as ex:
-                    self.log.exception(ex)
+                # was there a server bound to this instance?
+                if row:
+                    server: ServerImpl = DataObjectFactory().new(
+                        ServerImpl, node=self.node, port=instance.bot_port, name=row[0])
+                    instance.server = server
+                    self.servers[server.name] = server
+                else:
+                    self.log.warning(f"There is no server bound to instance {instance.name}!")
+            except Exception as ex:
+                self.log.exception(ex)
 
     async def send_init(self, server: Server):
         timeout = 120 if self.node.locals.get('slow_system', False) else 60
@@ -206,6 +208,7 @@ class ServiceBus(Service):
                 self.log.info('- Searching for local DCS servers (this might take a bit) ...')
             else:
                 return
+            num = 0
             calls: dict[str, Any] = dict()
             for server in local_servers:
                 try:
@@ -213,33 +216,34 @@ class ServiceBus(Service):
                         await self.send_init(server)
                     if server.maintenance:
                         self.log.warning(f'  => Maintenance mode enabled for Server {server.name}')
-                    if utils.is_open(server.instance.dcs_host, server.instance.dcs_port):
+                    if (utils.is_open(server.instance.dcs_host, server.instance.dcs_port) or
+                            utils.find_process("DCS_server.exe|DCS.exe", server.instance.name)):
                         calls[server.name] = asyncio.create_task(
                             server.send_to_dcs_sync({"command": "registerDCSServer"}, timeout)
                         )
                     else:
                         server.status = Status.SHUTDOWN
                         self.log.info(f"  => Local DCS-Server \"{server.name}\" registered as DOWN (no process).")
+                        num += 1
                 except Exception as ex:
                     self.log.error(f"Error while registering DCS-Server \"{server.name}\": {ex}")
             ret = await asyncio.gather(*(calls.values()), return_exceptions=True)
-            num = 0
             for i, name in enumerate(calls.keys()):
                 server = self.servers[name]
                 if isinstance(ret[i], TimeoutError) or isinstance(ret[i], asyncio.TimeoutError):
                     self.log.debug(f'  => Timeout while trying to contact DCS server "{server.name}".')
                     server.status = Status.SHUTDOWN
                     self.log.info(f"  => Local DCS-Server \"{server.name}\" registered as DOWN (not responding).")
+                    num += 1
                 elif isinstance(ret[i], Exception):
-                    self.log.error("  => Exception during registering: " + str(ret[i]), exc_info=True)
+                    self.log.error("  => Exception during registering: " + str(ret[i]), exc_info=ret[i])
                 else:
                     self.log.info(f"  => Local DCS-Server \"{server.name}\" registered as UP.")
                     num += 1
             if not self.servers:
                 self.log.warning('  => No local DCS servers configured!')
             else:
-                self.log.info(f"- {len([x for x in self.servers.values() if x.status != Status.UNREGISTERED])} local "
-                              f"DCS servers registered.")
+                self.log.info(f"- {num} local DCS servers registered.")
 
     async def register_remote_servers(self, node: Node):
         await self.send_to_node({
@@ -370,7 +374,9 @@ class ServiceBus(Service):
                 await conn.execute("""
                     INSERT INTO bans (ucid, banned_by, reason, banned_until) 
                     VALUES (%s, %s, %s, %s) 
-                    ON CONFLICT DO NOTHING
+                    ON CONFLICT (ucid) DO UPDATE 
+                    SET banned_by = excluded.banned_by, reason = excluded.reason, 
+                        banned_at = excluded.banned_at, banned_until = excluded.banned_until
                 """, (ucid, banned_by, reason, until.replace(tzinfo=None)))
         for server in self.servers.values():
             if server.status not in [Status.PAUSED, Status.RUNNING, Status.STOPPED]:
@@ -439,19 +445,19 @@ class ServiceBus(Service):
                 cast(InstanceProxy, _instance).home = home
                 server.instance = _instance
                 self.servers[server_name] = server
-                server.settings = settings
-                server.options = options
-                server.dcs_version = dcs_version
-                server.maintenance = maintenance
-                # to support remote channel configs (for remote testing)
-                if not server.locals.get('channels'):
-                    server.locals['channels'] = channels
-                # add eventlistener queue
-                if server.name not in self.udp_server.message_queue:
-                    self.udp_server.message_queue[server.name] = Queue()
-                    self.executor.submit(self.udp_server.process, server.name)
-                self.log.info(f"  => Remote DCS-Server \"{server.name}\" registered.")
+            server.dcs_version = dcs_version
+            server.maintenance = maintenance
             server.status = Status(status)
+            server.settings = settings
+            server.options = options
+            # to support remote channel configs (for remote testing)
+            if not server.locals.get('channels'):
+                server.locals['channels'] = channels
+            # add eventlistener queue
+            if server.name not in self.udp_server.message_queue:
+                self.udp_server.message_queue[server.name] = Queue()
+                self.executor.submit(self.udp_server.process, server.name)
+            self.log.info(f"  => Remote DCS-Server \"{server.name}\" registered.")
         except StopIteration:
             self.log.error(f"No configuration found for instance {instance} in config\nodes.yaml")
         except Exception as ex:
@@ -622,7 +628,7 @@ class ServiceBus(Service):
             if kwargs.get('server') and parameters.get('server').annotation != 'str':
                 kwargs['server'] = self.servers.get(kwargs['server'])
             if kwargs.get('instance') and parameters.get('instance').annotation != 'str':
-                kwargs['instance'] = next(x for x in self.node.instances if x.name == kwargs['instance'])
+                kwargs['instance'] = next((x for x in self.node.instances if x.name == kwargs['instance']), None)
             if self.master:
                 if kwargs.get('member'):
                     kwargs['member'] = self.bot.guilds[0].get_member(int(kwargs['member'][2:-1]))
@@ -634,7 +640,9 @@ class ServiceBus(Service):
                 if asyncio.iscoroutinefunction(func):
                     rc = await func(**kwargs)
                 else:
-                    rc = asyncio.to_thread(func, **kwargs)
+                    def _aux_func():
+                        return func(**kwargs)
+                    rc = await asyncio.to_thread(_aux_func)
                 return rc
         elif 'params' in data:
             for key, value in data['params'].items():
@@ -733,7 +741,7 @@ class ServiceBus(Service):
                                         self.log.debug(f"Not processed: {listeners[pos].plugin_name}")
                                         future.cancel()
                             else:
-                                self.loop.create_task(self.send_to_node(data))
+                                asyncio.run_coroutine_threadsafe(self.send_to_node(data), self.loop)
                         except Exception as ex:
                             self.log.exception(ex)
                         finally:

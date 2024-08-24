@@ -8,7 +8,7 @@ from core import Plugin, Status, PersistentReport, Channel, utils, Server, Repor
 from discord import app_commands
 from discord.ext import tasks
 from discord.utils import MISSING
-from services import DCSServerBot
+from services.bot import DCSServerBot
 
 _ = get_translation(__name__.split('.')[1])
 
@@ -89,7 +89,7 @@ class Pretense(Plugin):
 
     @tasks.loop(seconds=120)
     async def update_leaderboard(self):
-        for server in self.bot.servers.copy().values():
+        for server in self.bot.servers.values():
             try:
                 if server.status != Status.RUNNING:
                     continue

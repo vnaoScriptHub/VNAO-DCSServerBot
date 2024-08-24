@@ -1,5 +1,6 @@
-import asyncio
+import luadata
 import os
+import shutil
 
 from core import Instance, InstanceBusyError, Status, utils, DataObjectFactory
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ class InstanceImpl(Instance):
             autoexec.webgui_port = int(self.locals.get('webgui_port'))
         else:
             self.locals['webgui_port'] = autoexec.webgui_port or 8088
-        settings = {}
+        server_name = None
         settings_path = os.path.join(self.home, 'Config', 'serverSettings.lua')
         if os.path.exists(settings_path):
             settings = SettingsDict(self, settings_path, root='cfg')
@@ -37,19 +38,19 @@ class InstanceImpl(Instance):
                 settings['port'] = int(self.locals['dcs_port'])
             else:
                 self.locals['dcs_port'] = settings.get('port', 10308)
-        server_name = settings.get('name', 'DCS Server') if settings else None
-        if server_name and server_name == 'n/a':
-            server_name = None
-        asyncio.create_task(self.update_instance(server_name))
+            server_name = settings.get('name', 'DCS Server') if settings else None
+            if server_name == 'n/a':
+                server_name = None
+        self.update_instance(server_name)
 
-    async def update_instance(self, server_name: Optional[str] = None):
-        async with self.apool.connection() as conn:
-            async with conn.transaction():
+    def update_instance(self, server_name: Optional[str] = None):
+        with self.pool.connection() as conn:
+            with conn.transaction():
                 # clean up old server name entries to avoid conflicts
-                await conn.execute("""
+                conn.execute("""
                     DELETE FROM instances WHERE server_name = %s
                 """, (server_name, ))
-                await conn.execute("""
+                conn.execute("""
                     INSERT INTO instances (node, instance, port, server_name)
                     VALUES (%s, %s, %s, %s) 
                     ON CONFLICT (node, instance) DO UPDATE 
@@ -60,10 +61,10 @@ class InstanceImpl(Instance):
     def home(self) -> str:
         return os.path.expandvars(self.locals.get('home', os.path.join(SAVED_GAMES, self.name)))
 
-    async def update_server(self, server: Optional["Server"] = None):
-        async with self.apool.connection() as conn:
-            async with conn.transaction():
-                await conn.execute("""
+    def update_server(self, server: Optional["Server"] = None):
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute("""
                     UPDATE instances SET server_name = %s, last_seen = (now() AT TIME ZONE 'utc') 
                     WHERE node = %s AND instance = %s
                 """, (server.name if server else None, self.node.name, self.name))
@@ -72,12 +73,18 @@ class InstanceImpl(Instance):
         if self._server and self._server.status not in [Status.UNREGISTERED, Status.SHUTDOWN]:
             raise InstanceBusyError()
         self._server = server
+        # delete the serverSettings.lua to unlink the current server
+        if not server:
+            settings_path = os.path.join(self.home, 'Config', 'serverSettings.lua')
+            if os.path.exists(settings_path):
+                os.remove(settings_path)
         self.prepare()
         if server and server.name:
             server.instance = self
-        asyncio.create_task(self.update_server(server))
+        self.update_server(server)
 
     def prepare(self):
+        # desanitisation of Slmod (if there)
         if self.node.locals['DCS'].get('desanitize', True):
             # check for SLmod and desanitize its MissionScripting.lua
             for version in range(5, 7):
@@ -86,3 +93,24 @@ class InstanceImpl(Instance):
                 if os.path.exists(filename):
                     utils.desanitize(self, filename)
                     break
+        # Profanity filter
+        if self.server.locals.get('profanity_filter', False):
+            language = self.node.config.get('language', 'en')
+            wordlist = os.path.join(self.node.config_dir, 'profanity.txt')
+            if not os.path.exists(wordlist):
+                shutil.copy2(os.path.join('samples', 'wordlists', f"{language}.txt"), wordlist)
+            with open(wordlist, mode='r', encoding='utf-8') as wl:
+                words = [x.strip() for x in wl.readlines() if not x.startswith('#')]
+            targetfile = os.path.join(os.path.expandvars(self.node.locals['DCS']['installation']), 'Data', 'censor.lua')
+            bakfile = targetfile.replace('.lua', '.bak')
+            if not os.path.exists(bakfile):
+                shutil.copy2(targetfile, bakfile)
+            with open(targetfile, mode='wb') as outfile:
+                outfile.write((f"{language.upper()} = " + luadata.serialize(
+                    words, indent='\t', indent_level=0)).encode('utf-8'))
+        else:
+            targetfile = os.path.join(os.path.expandvars(self.node.locals['DCS']['installation']), 'Data', 'censor.lua')
+            bakfile = targetfile.replace('.lua', '.bak')
+            if os.path.exists(bakfile):
+                shutil.copy2(bakfile, targetfile)
+                os.remove(bakfile)
