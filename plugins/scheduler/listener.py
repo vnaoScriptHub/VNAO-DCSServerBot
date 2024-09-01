@@ -30,6 +30,12 @@ class SchedulerListener(EventListener):
                     return delta, restart
                 else:
                     return 0, restart
+            elif 'idle_time' in restart and server.idle_since:
+                delta = int((datetime.now(timezone.utc) - server.idle_since).total_seconds())
+                if delta >= 0:
+                    return delta, restart
+                else:
+                    return 0, restart
             elif 'local_times' in restart:
                 min_time_difference = 86400
                 for t in restart['local_times']:
@@ -85,7 +91,7 @@ class SchedulerListener(EventListener):
             asyncio.create_task(self.node.shell_command(cmd))
 
     async def process(self, server: Server, what: dict) -> None:
-        if 'shutdown' in what['command']:
+        if 'shutdown' in what['command'] or what.get('shutdown', False):
             await server.shutdown()
             message = 'shut down DCS server'
             if 'user' not in what:

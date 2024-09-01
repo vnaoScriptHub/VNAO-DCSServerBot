@@ -2,7 +2,7 @@ import asyncio
 import importlib
 import importlib.util
 
-from core import NodeImpl, ServiceRegistry, EventListener, Server, Plugin
+from core import NodeImpl, ServiceRegistry, EventListener, Server, Plugin, PluginError
 from typing import Union, Optional, Any
 
 from services.bot.dummy import DummyGuild, DummyMember, DummyRole
@@ -32,6 +32,7 @@ class DummyBot:
         self.guilds = [DummyGuild()]
         self.owner_id = -1
         self.latency = 0
+        self.member = DummyMember("1", name="DCSServerBot")
 
     async def start(self):
         self.log.warning("This installation does not use a Discord bot!")
@@ -39,10 +40,10 @@ class DummyBot:
         # noinspection PyAsyncCall
         asyncio.create_task(self.setup_hook())
 
-    async def stop(self):
+    async def close(self):
         for plugin in self.cogs.values():
             await plugin.cog_unload()
-        await self.close()
+        self.closed = True
 
     async def login(self, token: str) -> None:
         ...
@@ -55,9 +56,6 @@ class DummyBot:
 
     def is_closed(self) -> bool:
         return self.closed
-
-    async def close(self) -> None:
-        self.closed = True
 
     @property
     def roles(self) -> dict[str, list[Union[str, int]]]:
@@ -86,8 +84,14 @@ class DummyBot:
     async def load_plugin(self, plugin_name: str) -> bool:
         module = importlib.import_module(f"plugins.{plugin_name}.commands")
         if hasattr(module, 'setup'):
-            await module.setup(self)
-            return True
+            try:
+                await module.setup(self)
+                return True
+            except PluginError as ex:
+                self.log.error(f'  - {ex}')
+            except Exception as ex:
+                self.log.error(f'  - Plugin "{plugin_name.title()} not loaded!', exc_info=ex)
+            return False
         else:
             self.log.error(f"No 'setup' function in {plugin_name}")
             return False
@@ -149,3 +153,12 @@ class DummyBot:
 
     async def fetch_user(self, ucid: str) -> Optional[DummyMember]:
         return await self.guilds[0].fetch_member(ucid)
+
+    def add_command(self, command: Any, /) -> None:
+        ...
+
+    def remove_command(self, name: str, /) -> None:
+        ...
+
+    async def fetch_channel(self, channel_id: int, /) -> None:
+        ...

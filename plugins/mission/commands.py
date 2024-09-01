@@ -1660,8 +1660,9 @@ class Mission(Plugin):
                     if not player or player.check_exemptions(exemptions):
                         continue
                     if (datetime.now(timezone.utc) - dt).total_seconds() > max_time:
-                        msg = server.locals['messages']['message_afk'].format(player=player,
-                                                                              time=utils.format_time(max_time))
+                        msg = server.locals.get('afk', {}).get(
+                            'message_afk', '{player.name}, you have been kicked for being AFK for more than {time}.'
+                        ).format(player=player, time=utils.format_time(max_time))
                         await server.kick(player, msg)
         except Exception as ex:
             self.log.exception(ex)
@@ -1774,9 +1775,15 @@ class Mission(Plugin):
                     self.log.error(msg)
                     await message.channel.send(_(msg))
                     return
-                self.log.debug("Mission added to the mission list.")
-                await message.channel.send(_('Mission "{mission}" uploaded to server {server} and added.').format(
-                    mission=name, server=server.display_name))
+                msg = _('Mission "{mission}" uploaded to server {server}').format(mission=name,
+                                                                                  server=server.display_name)
+                if server.locals.get('autoadd', True):
+                    self.log.debug("Mission added to the mission list.")
+                    msg += _(' and added')
+                    await message.channel.send(msg)
+                else:
+                    await message.channel.send(msg)
+                    return
             finally:
                 await self.bot.audit(f'uploaded mission "{name}"', server=server, user=message.author)
 

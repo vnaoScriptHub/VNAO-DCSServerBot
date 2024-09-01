@@ -52,7 +52,7 @@ class LotAtc(Extension, FileSystemEventHandler):
             "blue": {},
             "red": {}
         }
-        atexit.register(self.shutdown)
+        atexit.register(self.stop_observer)
 
     def load_config(self) -> Optional[dict]:
         cfg = {}
@@ -98,6 +98,11 @@ class LotAtc(Extension, FileSystemEventHandler):
             config['srs_server'] = '127.0.0.1'
             srs_port = extension.config.get('port', extension.locals['Server Settings']['SERVER_PORT'])
             config['srs_server_port'] = srs_port
+            srs_transponder_port = extension.config.get('srs_transponder_port',
+                                                        extension.locals['General Settings']['LOTATC_EXPORT_PORT'])
+            if srs_transponder_port:
+                config['srs_use_transponder'] = True
+                config['srs_transponder_port'] = srs_transponder_port
 
         if len(config):
             self.locals = self.locals | config
@@ -193,12 +198,15 @@ class LotAtc(Extension, FileSystemEventHandler):
         self.observer.start()
         return True
 
-    def shutdown(self) -> bool:
+    def stop_observer(self):
         if self.observer:
-            super().shutdown()
             self.observer.stop()
             self.observer.join(timeout=10)
             self.observer = None
+
+    def shutdown(self) -> bool:
+        super().shutdown()
+        self.stop_observer()
         return True
 
     def is_running(self) -> bool:
