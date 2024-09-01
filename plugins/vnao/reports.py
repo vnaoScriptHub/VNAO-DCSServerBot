@@ -228,7 +228,7 @@ class Greenie(EmbedElement):
                                             custom_flags=['--default-background-color=00000000', '--hide-scrollbars'])
                 hti.output_path = temp_png.parent
                 # hti.temp_path = temp_folder.name
-                self.log.debug(f"html2image output_path: {hti.output_path}")
+                # self.log.debug(f"html2image output_path: {hti.output_path}")
                 hti.screenshot(
                     html_file=str(temp_html),
                     css_file=css_file,
