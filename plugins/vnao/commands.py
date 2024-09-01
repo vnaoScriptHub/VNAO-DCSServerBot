@@ -9,7 +9,7 @@ from discord import app_commands
 from io import BytesIO
 from pathlib import Path
 from pprint import pprint
-from services import DCSServerBot
+from services.bot import DCSServerBot
 from typing import Type, Optional
 
 from .listener import VnaoEventListener

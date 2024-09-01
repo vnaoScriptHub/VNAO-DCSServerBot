@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from pprint import pprint
 from psycopg.rows import dict_row
-from services import DCSServerBot
+from services.bot import DCSServerBot
 from plugins.creditsystem.player import CreditPlayer
 
 
