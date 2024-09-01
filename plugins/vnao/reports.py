@@ -189,10 +189,13 @@ class Greenie(EmbedElement):
             temp_folder = tempfile.TemporaryDirectory(prefix="DCSServerBot.vnao.")
             temp_png = Path(tempfile.NamedTemporaryFile(delete=False, dir=temp_folder.name, suffix='.png').name)
             temp_html = Path(tempfile.NamedTemporaryFile(delete=False, dir=temp_folder.name, suffix='.html').name)
+            
+            # self.log.debug(f"Exists - temp_png:{Path.exists(temp_png)}  temp_html:{Path.exists(temp_png)}")
+
             # temp_board_image.close()
             # temp_path = Path(temp_board_image.name)
-            self.log.debug(f"Temp png file: {temp_png}")
-            self.log.debug(f"Temp html file: {temp_html}")
+            # self.log.debug(f"Temp png file: {temp_png}")
+            # self.log.debug(f"Temp html file: {temp_html}")
                 
             # Generate a temp html file.
             # jinja2_board_template = config['greenie_boards']['jinja2_template_strafe']
@@ -212,11 +215,20 @@ class Greenie(EmbedElement):
             else:
                 board_width = board_width_min
 
+            self.log.debug(f"Creating html2image files.")
+
             # Converts the html file into a png
+            # html2image can have issues with certain versions of Chrome.  To fix this issue an older version
+            # of chrome is used as it is known to work correctly.
+            # Download this version and install:
+            #  - https://sourceforge.net/projects/portableapps/files/Google%20Chrome%20Portable/GoogleChromePortable64_109.0.5414.120_online.paf.exe/download
+            # Update the browser_exectuable path parameter to it's location and it should work.
             if css_file:
-                hti = html2image.Html2Image()
-                hti.browser.flags = ['--default-background-color=00000000', '--hide-scrollbars']
+                hti = html2image.Html2Image(browser_executable="C:\\Users\\vnaon\\GoogleChromePortable64\\GoogleChromePortable.exe",
+                                            custom_flags=['--default-background-color=00000000', '--hide-scrollbars'])
                 hti.output_path = temp_png.parent
+                # hti.temp_path = temp_folder.name
+                self.log.debug(f"html2image output_path: {hti.output_path}")
                 hti.screenshot(
                     html_file=str(temp_html),
                     css_file=css_file,
@@ -238,6 +250,7 @@ class Greenie(EmbedElement):
                 buf: BytesIO = BytesIO(fh.read())
             self.env.buffer = buf
             self.env.filename = temp_png.name
+            # self.log.debug(f"attachment://{temp_png.name}")
             self.embed.set_image(url=f"attachment://{temp_png.name}")
 
             # This will remove the temp files that were created
@@ -384,10 +397,17 @@ class Range(EmbedElement):
             else:
                 board_width = board_width_min
 
+            self.log.debug(f"Creating html2image files.")
+
             # Convert the html file into a png
+            # html2image can have issues with certain versions of Chrome.  To fix this issue an older version
+            # of chrome is used as it is known to work correctly.
+            # Download this version and install:
+            #  - https://sourceforge.net/projects/portableapps/files/Google%20Chrome%20Portable/GoogleChromePortable64_109.0.5414.120_online.paf.exe/download
+            # Update the browser_exectuable path parameter to it's location and it should work.
             if css_file:
-                hti = html2image.Html2Image()
-                hti.browser.flags = ['--default-background-color=00000000', '--hide-scrollbars']
+                hti = html2image.Html2Image(browser_executable="C:\\Users\\vnaon\\GoogleChromePortable64\\GoogleChromePortable.exe",
+                                            custom_flags=['--default-background-color=00000000', '--hide-scrollbars'])
                 hti.output_path = temp_png.parent
                 hti.screenshot(
                     html_file=str(temp_html),
