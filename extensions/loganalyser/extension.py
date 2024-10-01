@@ -4,6 +4,8 @@ import os
 import re
 
 from core import Extension, Server, ServiceRegistry, Status, Coalition, utils, get_translation
+from datetime import datetime
+from services.bot import BotService
 from services.servicebus import ServiceBus
 from typing import Callable
 
@@ -11,6 +13,7 @@ _ = get_translation(__name__.split('.')[1])
 
 ERROR_UNLISTED = r"ERROR\s+ASYNCNET\s+\(Main\):\s+Server update failed with code -?\d+\.\s+The server will be unlisted."
 ERROR_SCRIPT = r'Mission script error: \[string "(.*)"\]:(\d+): (.*)'
+MOOSE_COMMIT_LOG = r"\*\*\* MOOSE GITHUB Commit Hash ID: (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{2}:\d{2})-\w+ \*\*\*"
 
 __all__ = [
     "LogAnalyser"
@@ -42,6 +45,7 @@ class LogAnalyser(Extension):
         self.errors.clear()
         self.register_callback(ERROR_UNLISTED, self.unlisted)
         self.register_callback(ERROR_SCRIPT, self.script_error)
+        self.register_callback(MOOSE_COMMIT_LOG, self.moose_log)
         # noinspection PyAsyncCall
         asyncio.create_task(self.check_log())
 
@@ -69,25 +73,20 @@ class LogAnalyser(Extension):
                 self.config.get('log', os.path.join(self.server.instance.home, 'Logs', 'dcs.log'))
             )
             while not self.stop_event.is_set():
-                if not os.path.exists(logfile):
+                while not os.path.exists(logfile):
                     self.log_pos = 0
                     await asyncio.sleep(1)
-                    continue
                 async with aiofiles.open(logfile, mode='r', encoding='utf-8', errors='ignore') as file:
                     max_pos = os.fstat(file.fileno()).st_size
-                    # no new data has been added to the log, so continue
-                    if max_pos == self.log_pos:
+                    if self.log_pos == -1 or max_pos == self.log_pos:
+                        self.log_pos = max_pos
                         await asyncio.sleep(1)
                         continue
-                    # if we were started with an existing logfile, seek to the file end, else seek to the last position
-                    if self.log_pos == -1:
-                        await file.seek(0, 2)
-                        self.log_pos = max_pos
-                    else:
-                        # if the log was rotated, reset the pointer to 0
-                        if max_pos < self.log_pos:
-                            self.log_pos = 0
-                        await file.seek(self.log_pos, 0)
+                    # if the logfile was rotated, seek to the beginning of the file
+                    elif max_pos < self.log_pos:
+                        self.log_pos = 0
+
+                    self.log_pos = await file.seek(self.log_pos, 0)
                     lines = await file.readlines()
                     for idx, line in enumerate(lines):
                         if '=== Log closed.' in line:
@@ -101,7 +100,7 @@ class LogAnalyser(Extension):
                                     asyncio.create_task(callback(self.log_pos + idx, line, match))
                                 else:
                                     self.loop.run_in_executor(None, callback, self.log_pos + idx, line, match)
-                    self.log_pos = max_pos
+                    self.log_pos = await file.tell()
         except Exception as ex:
             self.log.exception(ex)
         finally:
@@ -112,6 +111,19 @@ class LogAnalyser(Extension):
         await server.sendPopupMessage(
             Coalition.ALL, self.config.get('message_unlist', 'Server is going to restart in {}!').format(
                 utils.format_time(warn_time)))
+
+    async def send_alert(self, title: str, message: str):
+        params = {
+            "title": title,
+            "message": message,
+            'server': self.server.name
+        }
+        await self.bus.send_to_node({
+            "command": "rpc",
+            "service": BotService.__name__,
+            "method": "alert",
+            "params": params
+        })
 
     async def unlisted(self, idx: int, line: str, match: re.Match):
         if not self.config.get('restart_on_unlist', False):
@@ -154,3 +166,23 @@ class LogAnalyser(Extension):
             return
         await self._send_audit_msg(filename, int(line_number), error_message)
         self.errors.add((filename, int(line_number)))
+
+    async def moose_log(self, idx: int, line: str, match: re.Match):
+        timestamp_str = match.group(1)
+        timestamp = datetime.fromisoformat(timestamp_str)
+        if timestamp < datetime.fromisoformat('2024-09-03T16:47:17+02:00'):
+            embed = utils.create_warning_embed(
+                title='Outdated Moose version found!',
+                text=f"Mission {self.server.current_mission.name} is using an old Moose version. "
+                     f"You will probably see performance issues!")
+            try:
+                await self.bus.send_to_node_sync({
+                    "command": "rpc",
+                    "service": BotService.__name__,
+                    "method": "send_message",
+                    "params": {
+                        "embed": embed.to_dict()
+                    }
+                })
+            except Exception as ex:
+                self.log.exception(ex)

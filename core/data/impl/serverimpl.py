@@ -9,7 +9,6 @@ import shutil
 import socket
 import subprocess
 import sys
-import time
 import traceback
 
 if sys.platform == 'win32':
@@ -22,17 +21,16 @@ from copy import deepcopy
 from core import utils, Server
 from core.data.dataobject import DataObjectFactory
 from core.data.const import Status, Channel, Coalition
-from core.extension import InstallException, UninstallException
+from core.extension import Extension, InstallException, UninstallException
 from core.mizfile import MizFile, UnsupportedMizFileException
 from core.data.node import UploadStatus
 from core.utils.performance import performance_log
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePath
-from psutil import Process, NoSuchProcess
 from typing import Optional, TYPE_CHECKING, Union, Any
+from watchdog.events import FileSystemEventHandler, FileSystemEvent, FileSystemMovedEvent
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 
 
 # ruamel YAML support
@@ -40,9 +38,8 @@ from ruamel.yaml import YAML
 yaml = YAML()
 
 if TYPE_CHECKING:
-    from core import Extension, Instance
+    from core import Instance
     from services.bot import DCSServerBot
-    from watchdog.events import FileSystemEvent, FileSystemMovedEvent
 
 DEFAULT_EXTENSIONS = {
     "LogAnalyser": {}
@@ -346,8 +343,7 @@ class ServerImpl(Server):
             if os.path.exists(filename):
                 data = yaml.load(Path(filename).read_text(encoding='utf-8'))
                 if old_name in data and new_name not in data:
-                    data[new_name] = deepcopy(data[old_name])
-                    del data[old_name]
+                    data[new_name] = data.pop(old_name)
                     with open(filename, mode='w', encoding='utf-8') as outfile:
                         yaml.dump(data, outfile)
             # update serverSettings.lua if requested
@@ -425,7 +421,7 @@ class ServerImpl(Server):
             p = subprocess.Popen(
                 [exe, '--server', '--norender', '-w', self.instance.name], executable=path, close_fds=True
             )
-            self.process = Process(p.pid)
+            self.process = psutil.Process(p.pid)
             if 'priority' in self.locals:
                 self.set_priority(self.locals.get('priority'))
             if 'affinity' in self.locals:
@@ -469,7 +465,8 @@ class ServerImpl(Server):
             try:
                 await ext.prepare()
             except Exception as ex:
-                self.log.error(f"  => Error during {ext.name}.prepare(): {ex}. Skipped.")
+                self.log.exception(ex)
+                self.log.error(f"  => Error during {ext.name}.prepare() - skipped.")
 
     @staticmethod
     def _window_enumeration_handler(hwnd, top_windows):
@@ -568,7 +565,12 @@ class ServerImpl(Server):
         if await self.is_running():
             if not force:
                 await super().shutdown(False)
-            self._terminate()
+                # wait 30/60s for the process to terminate
+                for i in range(1, 60 if self.node.locals.get('slow_system', False) else 30):
+                    if not self.process.is_running():
+                        break
+                    await asyncio.sleep(1)
+            await self._terminate()
         self.status = Status.SHUTDOWN
 
     async def is_running(self) -> bool:
@@ -577,17 +579,22 @@ class ServerImpl(Server):
                 self.process = await asyncio.to_thread(utils.find_process, "DCS_server.exe|DCS.exe", self.instance.name)
             return self.process is not None
 
-    def _terminate(self) -> None:
-        if self.process:
-            try:
-                if self.process.is_running():
-                    self.process.terminate()
-                    time.sleep(2)
-                if self.process.is_running():
-                    self.process.kill()
-            except NoSuchProcess:
-                pass
-        self.process = None
+    async def _terminate(self) -> None:
+        try:
+            if not self.process.is_running():
+                return
+            self.process.terminate()
+            # wait 30/60s for the process to terminate
+            for i in range(1, 60 if self.node.locals.get('slow_system', False) else 30):
+                if not self.process.is_running():
+                    return
+                await asyncio.sleep(1)
+            else:
+                self.process.kill()
+        except psutil.NoSuchProcess:
+            pass
+        finally:
+            self.process = None
 
     @performance_log()
     async def apply_mission_changes(self, filename: Optional[str] = None) -> str:
@@ -601,16 +608,17 @@ class ServerImpl(Server):
                 return filename
         new_filename = filename
         try:
-            # make an initial backup, if there is none
-            if '.dcssb' not in filename and not os.path.exists(filename + '.orig'):
-                shutil.copy2(filename, filename + '.orig')
             # process all mission modifications
             dirty = False
             for ext in self.extensions.values():
-                new_filename, _dirty = await ext.beforeMissionLoad(new_filename)
-                if _dirty:
-                    self.log.info(f'  => {ext.name} applied on {new_filename}.')
-                dirty |= _dirty
+                if type(ext).beforeMissionLoad != Extension.beforeMissionLoad:
+                    # make an initial backup, if there is none
+                    if '.dcssb' not in filename and not os.path.exists(filename + '.orig'):
+                        shutil.copy2(filename, filename + '.orig')
+                    new_filename, _dirty = await ext.beforeMissionLoad(new_filename)
+                    if _dirty:
+                        self.log.info(f'  => {ext.name} applied on {new_filename}.')
+                    dirty |= _dirty
             # we did not change anything in the mission
             if not dirty:
                 return filename
@@ -734,12 +742,12 @@ class ServerImpl(Server):
             if password:
                 advanced['bluePasswordHash'] = utils.hash_password(password)
             else:
-                del advanced['bluePasswordHash']
+                advanced.pop('bluePasswordHash', None)
         else:
             if password:
                 advanced['redPasswordHash'] = utils.hash_password(password)
             else:
-                del advanced['redPasswordHash']
+                advanced.pop('redPasswordHash', None)
         self.settings['advanced'] = advanced
         async with self.apool.connection() as conn:
             async with conn.transaction():
@@ -849,6 +857,9 @@ class ServerImpl(Server):
         # re-read config
         self.node.locals = self.node.read_locals()
         self.locals |= self.node.locals['instances'][self.instance.name]
+        self.instance.locals |= self.node.locals['instances'][self.instance.name]
+        if name in self.extensions:
+            self.extensions[name].config = config
 
     async def install_extension(self, name: str, config: dict) -> None:
         if name in self.extensions:
@@ -863,5 +874,5 @@ class ServerImpl(Server):
         if not ext:
             raise UninstallException(f"Extension {name} is not installed!")
         await ext.uninstall()
-        del self.extensions[name]
+        self.extensions.pop(name, None)
         await self.config_extension(name, {"enabled": False})

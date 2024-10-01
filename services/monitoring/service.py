@@ -175,6 +175,9 @@ class MonitoringService(Service):
                     return
                 # only escalate, if the server was not stopped (maybe the process was manually shut down)
                 if server.status != Status.STOPPED:
+                    now = datetime.now(timezone.utc)
+                    shutil.copy2(os.path.join(server.instance.home, 'Logs', 'dcs.log'),
+                                 os.path.join(server.instance.home, 'Logs', f"dcs-{now.strftime('%Y%m%d-%H%M%S')}.log"))
                     title = f'Server "{server.name}" died!'
                     message = 'Setting state to SHUTDOWN.'
                     self.log.warning(title + ' ' + message)
@@ -198,6 +201,7 @@ class MonitoringService(Service):
                     # check extension states
                     for ext in [x for x in server.extensions.values() if not await asyncio.to_thread(x.is_running)]:
                         try:
+                            self.log.warning(f"{ext.name} died - restarting ...")
                             await ext.startup()
                         except Exception as ex:
                             self.log.exception(ex)
@@ -262,6 +266,8 @@ class MonitoringService(Service):
                 await self.bus.send_to_node(await asyncio.to_thread(self._pull_load_params, server))
             except (psutil.AccessDenied, PermissionError):
                 self.log.debug(f"Server {server.name} was not started by the bot, skipping server load gathering.")
+            except psutil.NoSuchProcess:
+                self.log.debug(f"Server {server.name} died, skipping server load gathering.")
 
     @tasks.loop(minutes=1.0)
     async def monitoring(self):

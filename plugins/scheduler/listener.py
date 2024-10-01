@@ -17,7 +17,10 @@ class SchedulerListener(EventListener):
                     results.append(result)
             return min(results, key=lambda x: x[0]) if results else None
         else:
-            mission_time = restart.get('max_mission_time', restart.get('mission_time'))
+            if server.is_populated():
+                mission_time = restart.get('max_mission_time', restart.get('mission_time'))
+            else:
+                mission_time = restart.get('mission_time')
             if mission_time:
                 delta = mission_time * 60 - int(server.current_mission.mission_time)
                 if delta >= 0:
@@ -31,7 +34,7 @@ class SchedulerListener(EventListener):
                 else:
                     return 0, restart
             elif 'idle_time' in restart and server.idle_since:
-                delta = int((datetime.now(timezone.utc) - server.idle_since).total_seconds())
+                delta = restart['idle_time'] * 60 - int((datetime.now(timezone.utc) - server.idle_since).total_seconds())
                 if delta >= 0:
                     return delta, restart
                 else:
@@ -270,7 +273,7 @@ class SchedulerListener(EventListener):
             server.on_empty.clear()
             server.on_mission_end.clear()
             await player.sendChatMessage('Maintenance mode enabled.')
-            await self.bot.audit("set maintenance flag", user=player.member, server=server)
+            await self.bot.audit("set maintenance flag", user=player.member or player.ucid, server=server)
         else:
             await player.sendChatMessage('Maintenance mode is already active.')
 
@@ -279,7 +282,7 @@ class SchedulerListener(EventListener):
         if server.maintenance:
             server.maintenance = False
             await player.sendChatMessage('Maintenance mode disabled/cleared.')
-            await self.bot.audit("cleared maintenance flag", user=player.member, server=server)
+            await self.bot.audit("cleared maintenance flag", user=player.member or player.ucid, server=server)
         else:
             await player.sendChatMessage("Maintenance mode wasn't enabled.")
 

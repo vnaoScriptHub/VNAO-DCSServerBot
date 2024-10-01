@@ -5,7 +5,7 @@ if TYPE_CHECKING:
 
 
 class DummyMember:
-    def __init__(self, id: str, *, name: str = None):
+    def __init__(self, id: str, *, name: str = ""):
         self._id = id
         self._name = name
         self._roles: dict[str, "DummyRole"] = {}
@@ -20,6 +20,10 @@ class DummyMember:
 
     @property
     def name(self) -> str:
+        return self._name
+
+    @property
+    def display_name(self) -> str:
         return self._name
 
     async def add_roles(self, roles: list["DummyRole"]) -> None:

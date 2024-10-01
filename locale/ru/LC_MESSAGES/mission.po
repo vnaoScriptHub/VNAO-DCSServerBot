@@ -335,6 +335,22 @@ msgstr "Сообщение отправлено."
 msgid "Sends a chat message to a player\n"
 msgstr "Отправляет chat сообщение игроку\n"
 
+# /player screenshot
+msgid "Server can not take screenshots."
+msgstr "Сервер не может делать скриншоты."
+
+msgid "Requesting screenshot ..."
+msgstr "Запрос скриншота ..."
+
+msgid "Timeout while waiting for screenshot!"
+msgstr "Превышено время ожидания скриншота!"
+
+msgid "Screenshot of Player {}"
+msgstr "Скриншот игрока {}"
+
+msgid "Taken by"
+msgstr "Сделал"
+
 # /watch add
 msgid "Puts a player onto the watchlist"
 msgstr "Добавляет игрока в список отслеживания"
@@ -515,6 +531,9 @@ msgstr "Файл существует. Вы хотите перезаписат�
 
 msgid "Error while uploading: {}"
 msgstr "Ошибка во время загрузки: {}"
+
+msgid "Mission \"{mission}\" uploaded to server {server} and NOT added."
+msgstr "Миссия \"{mission}\" загружена на сервер {server} и НЕ добавлена."
 
 msgid "Mission \"{mission}\" uploaded to server {server}.\n"
 "As you have \"autoscan\" enabled, it might take some seconds to appear in your mission list."
