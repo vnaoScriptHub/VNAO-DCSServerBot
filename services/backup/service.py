@@ -16,13 +16,10 @@ __all__ = ["BackupService"]
 @ServiceRegistry.register(plugin="backup")
 class BackupService(Service):
     def __init__(self, node):
-        from services.servicebus import ServiceBus
-
         super().__init__(node=node, name="Backup")
         if not self.locals:
             self.log.debug("  - No backup.yaml configured, skipping backup service.")
             return
-        self.bus = ServiceRegistry.get(ServiceBus)
         if self._secure_password():
             self.save_config()
 
@@ -80,10 +77,13 @@ class BackupService(Service):
             zf.close()
 
     def backup_servers(self) -> bool:
+        from services.servicebus import ServiceBus
+
         target = self.mkdir()
         config = self.locals['backups'].get('servers')
         rc = True
-        for server_name, server in self.bus.servers.items():
+
+        for server_name, server in ServiceRegistry.get(ServiceBus).servers.items():
             self.log.info(f'Backing up server "{server_name}" ...')
             filename = f"{server.instance.name}_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".zip"
             zf = ZipFile(os.path.join(target, filename), mode="w")
@@ -152,17 +152,20 @@ class BackupService(Service):
 
     @tasks.loop(minutes=1)
     async def schedule(self):
-        jobs = []
-        if self.node.master:
-            if 'bot' in self.locals['backups'] and self.can_run(self.locals['backups']['bot']):
-                jobs.append(asyncio.create_task(asyncio.to_thread(self.backup_bot)))
-            if 'database' in self.locals['backups'] and self.can_run(self.locals['backups']['database']):
-                jobs.append(asyncio.create_task(asyncio.to_thread(self.backup_database)))
-        if 'servers' in self.locals['backups'] and self.can_run(self.locals['backups']['servers']):
-            jobs.append(asyncio.create_task(asyncio.to_thread(self.backup_servers)))
-        if jobs:
-            await asyncio.gather(*jobs)
-            self.log.info("Backup finished.")
+        try:
+            jobs = []
+            if self.node.master:
+                if 'bot' in self.locals['backups'] and self.can_run(self.locals['backups']['bot']):
+                    jobs.append(asyncio.create_task(asyncio.to_thread(self.backup_bot)))
+                if 'database' in self.locals['backups'] and self.can_run(self.locals['backups']['database']):
+                    jobs.append(asyncio.create_task(asyncio.to_thread(self.backup_database)))
+            if 'servers' in self.locals['backups'] and self.can_run(self.locals['backups']['servers']):
+                jobs.append(asyncio.create_task(asyncio.to_thread(self.backup_servers)))
+            if jobs:
+                await asyncio.gather(*jobs)
+                self.log.info("Backup finished.")
+        except Exception as ex:
+            self.log.exception(ex)
 
     @tasks.loop(hours=24)
     async def delete(self):

@@ -58,9 +58,8 @@ class Lardoon(Extension):
                 self.log.debug("- Running Lardoon process found.")
 
     def _get_tacview_dir(self) -> str:
-        return self.config.get('tacviewExportPath',
-                               self.server.options['plugins']['Tacview'].get('tacviewExportPath',
-                                                                             TACVIEW_DEFAULT_DIR))
+        return self.config.get('tacviewExportPath', self.server.options['plugins']['Tacview'].get(
+            'tacviewExportPath')) or TACVIEW_DEFAULT_DIR
 
     async def startup(self) -> bool:
         global process, servers, tacview_dirs, lock
@@ -168,21 +167,21 @@ class Lardoon(Extension):
             if self.config.get('debug', False) and stdout:
                 self.log.debug(stdout.decode('utf-8'))
 
-        for tacview_dir, server_list in tacview_dirs.items():
-            if server_list and self.server.name == list(server_list)[0]:
-                break
-        else:
-            return
+        # make sure we're running on the correct schedule
         minutes = self.config.get('minutes', 5)
         if self.schedule.minutes != minutes:
             self.schedule.change_interval(minutes=minutes)
-        try:
-            cmd = os.path.expandvars(self.config['cmd'])
-            async with lock:
-                self.log.debug("Lardoon: Scheduled import run ...")
-                await asyncio.to_thread(run_subprocess, ["import", "-p", tacview_dir])
-            async with lock:
-                self.log.debug("Lardoon: Scheduled prune run ...")
-                await asyncio.to_thread(run_subprocess, ["prune", "--no-dry-run"])
-        except Exception as ex:
-            self.log.exception(ex)
+
+        for tacview_dir, server_list in tacview_dirs.items():
+            if not server_list:
+                continue
+            try:
+                cmd = os.path.expandvars(self.config['cmd'])
+                async with lock:
+                    self.log.debug("Lardoon: Scheduled import run ...")
+                    await asyncio.to_thread(run_subprocess, ["import", "-p", tacview_dir])
+                async with lock:
+                    self.log.debug("Lardoon: Scheduled prune run ...")
+                    await asyncio.to_thread(run_subprocess, ["prune", "--no-dry-run"])
+            except Exception as ex:
+                self.log.exception(ex)

@@ -51,7 +51,8 @@ class LotAtc(Plugin):
             return server
         ctx = await self.bot.get_context(message)
         # check if we are in the correct channel
-        if self.bot.locals.get('admin_channel', 0) != message.channel.id:
+        admin_channel = self.bot.locals.get('channels', {}).get('admin')
+        if not admin_channel or admin_channel != message.channel.id:
             return None
         try:
             return await utils.server_selection(
@@ -242,7 +243,7 @@ class LotAtc(Plugin):
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(_("You are not allowed to see the {} GCIs.").format(coalition))
             return
-        gcis = self.eventlistener.on_station.get(server.name, {}).get(coalition, {})
+        gcis = self.eventlistener.on_station.get(server.name, {}).get(Coalition(coalition), {})
         if not gcis:
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(

@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import traceback
 
 if sys.platform == 'win32':
@@ -111,6 +112,14 @@ class ServerImpl(Server):
                 self._maintenance = row[0]
         atexit.register(self._stop_observer)
 
+    def __eq__(self, other):
+        if isinstance(other, ServerImpl):
+            return self.name == other.name
+        return False
+
+    def __hash__(self):
+        return hash(self.name)
+
     async def reload(self):
         self.locals = self.read_locals()
         self._channels.clear()
@@ -191,7 +200,7 @@ class ServerImpl(Server):
         directory = Path(self.instance.missions_dir)
         missions = self.settings['missionList']
         i: int = 0
-        for file in directory.glob('*.miz'):
+        for file in directory.rglob('*.miz'):
             secondary = os.path.join(os.path.dirname(file), '.dcssb', os.path.basename(file))
             if str(file) not in missions and secondary not in missions:
                 missions.append(str(file))
@@ -215,14 +224,25 @@ class ServerImpl(Server):
             self._settings['listStartIndex'] = new_start + 1
 
     def set_status(self, status: Union[Status, str]):
-        if status != self._status:
+        if isinstance(status, str):
+            new_status = Status(status)
+        else:
+            new_status = status
+        if new_status != self._status:
             # make sure the mission list is tidy on the first start
             if self._status == Status.UNREGISTERED and status == Status.SHUTDOWN:
                 if self.locals.get('autoscan', False):
                     self._init_mission_list()
                 else:
                     self._make_missions_unique()
-            super().set_status(status)
+                super().set_status(status)
+            elif self._status in [Status.UNREGISTERED, Status.LOADING] and new_status in [Status.RUNNING, Status.PAUSED]:
+                asyncio.create_task(self.init_extensions())
+                asyncio.create_task(self._startup_extensions(status))
+            elif self._status in [Status.RUNNING, Status.PAUSED, Status.SHUTTING_DOWN] and new_status in [Status.STOPPED, Status.SHUTDOWN]:
+                asyncio.create_task(self._shutdown_extensions(status))
+            else:
+                super().set_status(status)
 
     def _install_luas(self):
         dcs_path = os.path.join(self.instance.home, 'Scripts')
@@ -241,7 +261,7 @@ class ServerImpl(Server):
             admin_channel = self.channels.get(Channel.ADMIN)
             if not admin_channel:
                 data = yaml.load(Path(os.path.join(self.node.config_dir, 'services', 'bot.yaml')))
-                admin_channel = data.get('admin_channel', -1)
+                admin_channel = data.get('channels', {}).get('admin', -1)
             with open(os.path.join('Scripts', 'net', 'DCSServerBot', 'DCSServerBotConfig.lua.tmpl'), mode='r',
                       encoding='utf-8') as template:
                 with open(os.path.join(bot_home, 'DCSServerBotConfig.lua'), mode='w', encoding='utf-8') as outfile:
@@ -446,27 +466,30 @@ class ServerImpl(Server):
         )
 
     async def init_extensions(self) -> list[str]:
-        extensions = DEFAULT_EXTENSIONS | self.locals.get('extensions', {})
-        for extension in extensions:
-            try:
-                ext: Extension = self.extensions.get(extension)
-                if not ext:
-                    ext = self._load_extension(extension)
+        async with self.lock:
+            extensions = DEFAULT_EXTENSIONS | self.locals.get('extensions', {})
+            for extension in extensions:
+                try:
+                    ext: Extension = self.extensions.get(extension)
                     if not ext:
-                        continue
-                    if ext.is_installed():
-                        self.extensions[extension] = ext
-            except Exception as ex:
-                self.log.exception(ex)
-        return list(self.extensions.keys())
+                        ext = self._load_extension(extension)
+                        if not ext:
+                            continue
+                        if ext.is_installed():
+                            self.extensions[extension] = ext
+                except Exception as ex:
+                    self.log.exception(ex)
+            return list(self.extensions.keys())
 
     async def prepare_extensions(self):
-        for ext in self.extensions.values():
-            try:
-                await ext.prepare()
-            except Exception as ex:
-                self.log.exception(ex)
-                self.log.error(f"  => Error during {ext.name}.prepare() - skipped.")
+        async with self.lock:
+            for ext in self.extensions.values():
+                try:
+                    await ext.prepare()
+                except InstallException as ex:
+                    self.log.error(f"  => Error during {ext.name}.prepare(): {ex} - skipped")
+                except Exception as ex:
+                    self.log.error(f"  => Unknown error during {ext.name}.prepare() - skipped.", exc_info=True)
 
     @staticmethod
     def _window_enumeration_handler(hwnd, top_windows):
@@ -515,13 +538,13 @@ class ServerImpl(Server):
                 raise Exception("Your DCS installation is not desanitized properly to be used with DCSServerBot!")
             else:
                 utils.desanitize(self)
+        self.status = Status.LOADING
         await self.init_extensions()
         await self.prepare_extensions()
         if modify_mission:
             await self.apply_mission_changes()
         await asyncio.to_thread(self.do_startup)
         timeout = 300 if self.node.locals.get('slow_system', False) else 180
-        self.status = Status.LOADING
         try:
             await self.wait_for_status_change([Status.SHUTDOWN, Status.STOPPED, Status.PAUSED, Status.RUNNING], timeout)
             if self.status == Status.SHUTDOWN:
@@ -534,37 +557,52 @@ class ServerImpl(Server):
                 self.status = Status.SHUTDOWN
             raise
 
-    @performance_log()
-    async def startup_extensions(self) -> None:
-        not_running_extensions = [
-            ext for ext in self.extensions.values() if not await asyncio.to_thread(ext.is_running)
-        ]
-        startup_coroutines = [ext.startup() for ext in not_running_extensions]
+    async def _startup_extensions(self, status: Union[Status, str]) -> None:
+        async with self.lock:
+            not_running_extensions = [
+                ext for ext in self.extensions.values() if not await asyncio.to_thread(ext.is_running)
+            ]
+            startup_coroutines = [ext.startup() for ext in not_running_extensions]
 
-        results = await asyncio.gather(*startup_coroutines, return_exceptions=True)
+            results = await asyncio.gather(*startup_coroutines, return_exceptions=True)
 
-        for res in results:
-            if isinstance(res, Exception):
-                tb_str = "".join(
-                    traceback.format_exception(type(res), res, res.__traceback__))
-                self.log.error(f"Error during startup_extension(): %s", tb_str)
+            for res in results:
+                if isinstance(res, Exception):
+                    tb_str = "".join(
+                        traceback.format_exception(type(res), res, res.__traceback__))
+                    self.log.error(f"Error during startup_extension(): %s", tb_str)
+            # set the status after the extensions have been started
+            super().set_status(status)
 
-    async def shutdown_extensions(self) -> None:
-        running_extensions = [
-            ext for ext in self.extensions.values() if await asyncio.to_thread(ext.is_running)
-        ]
-        shutdown_coroutines = [asyncio.to_thread(ext.shutdown) for ext in running_extensions]
+    async def _shutdown_extensions(self, status: Union[Status, str]) -> None:
+        async with self.lock:
+            running_extensions = [
+                ext for ext in self.extensions.values() if await asyncio.to_thread(ext.is_running)
+            ]
+            shutdown_coroutines = [asyncio.to_thread(ext.shutdown) for ext in running_extensions]
 
-        results = await asyncio.gather(*shutdown_coroutines, return_exceptions=True)
+            results = await asyncio.gather(*shutdown_coroutines, return_exceptions=True)
 
-        for res in results:
-            if isinstance(res, Exception):
-                self.log.error(f"Error during shutdown_extension()", exc_info=res)
+            for res in results:
+                if isinstance(res, Exception):
+                    self.log.error(f"Error during shutdown_extension()", exc_info=res)
+
+            # set the status after the extensions have been shut down
+            super().set_status(status)
+
+    async def do_shutdown(self):
+        self.status = Status.SHUTTING_DOWN
+        slow_system = self.node.locals.get('slow_system', False)
+        timeout = 300 if slow_system else 180
+        await self.send_to_dcs({"command": "shutdown"})
+        with suppress(TimeoutError, asyncio.TimeoutError):
+            await self.wait_for_status_change([Status.STOPPED, Status.SHUTDOWN], timeout)
+        self.current_mission = None
 
     async def shutdown(self, force: bool = False) -> None:
         if await self.is_running():
             if not force:
-                await super().shutdown(False)
+                await self.do_shutdown()
                 # wait 30/60s for the process to terminate
                 for i in range(1, 60 if self.node.locals.get('slow_system', False) else 30):
                     if not self.process.is_running():
@@ -635,8 +673,7 @@ class ServerImpl(Server):
             return new_filename
         except Exception as ex:
             if isinstance(ex, UnsupportedMizFileException):
-                self.log.error(
-                    f'The mission {filename} is not compatible with MizEdit. Please re-save it in DCS World.')
+                self.log.error(ex)
             else:
                 self.log.exception(ex)
             if filename != new_filename and os.path.exists(new_filename):
@@ -657,10 +694,13 @@ class ServerImpl(Server):
                     WHERE node = %s AND server_name = %s
                 """, (self.node.name, self.name))
 
-    async def uploadMission(self, filename: str, url: str, force: bool = False) -> UploadStatus:
+    async def uploadMission(self, filename: str, url: str, force: bool = False, missions_dir: str = None) -> UploadStatus:
         stopped = False
+        if not missions_dir:
+            missions_dir = self.instance.missions_dir
+        filename = os.path.normpath(os.path.join(missions_dir, filename))
         for idx, name in enumerate(self.settings['missionList']):
-            if os.path.basename(name) == filename:
+            if (os.path.normpath(name) == filename) or (os.path.normpath(name) == os.path.join(os.path.dirname(filename), '.dcssb', os.path.basename(filename))):
                 if self.current_mission and idx == int(self.settings['listStartIndex']) - 1:
                     if not force:
                         return UploadStatus.FILE_IN_USE
@@ -668,8 +708,6 @@ class ServerImpl(Server):
                     stopped = True
                 filename = name
                 break
-        else:
-            filename = os.path.normpath(os.path.join(self.instance.missions_dir, filename))
         rc = await self.node.write_file(filename, url, force)
         if rc != UploadStatus.OK:
             return rc
@@ -678,9 +716,6 @@ class ServerImpl(Server):
         if stopped:
             await self.start()
         return UploadStatus.OK
-
-    async def listAvailableMissions(self) -> list[str]:
-        return [str(x) for x in sorted(Path(PurePath(self.instance.missions_dir)).glob("*.miz"))]
 
     async def getMissionList(self) -> list[str]:
         return self.settings.get('missionList', [])
@@ -793,7 +828,7 @@ class ServerImpl(Server):
             missions[mission_id - 1] = path
             self.settings['missionList'] = missions
 
-    async def loadMission(self, mission: Union[int, str], modify_mission: Optional[bool] = True) -> None:
+    async def loadMission(self, mission: Union[int, str], modify_mission: Optional[bool] = True) -> bool:
         if isinstance(mission, int):
             if mission > len(self.settings['missionList']):
                 mission = 1
@@ -806,11 +841,15 @@ class ServerImpl(Server):
         try:
             idx = self.settings['missionList'].index(filename) + 1
             if idx == int(self.settings['listStartIndex']):
-                await self.send_to_dcs({"command": "startMission", "filename": filename})
+                rc = await self.send_to_dcs_sync({"command": "startMission", "filename": filename})
             else:
-                await self.send_to_dcs({"command": "startMission", "id": idx})
+                rc = await self.send_to_dcs_sync({"command": "startMission", "id": idx})
         except ValueError:
-            await self.send_to_dcs({"command": "startMission", "filename": filename})
+            rc = await self.send_to_dcs_sync({"command": "startMission", "filename": filename})
+        # We could not load the mission
+        if not rc['result']:
+            return False
+        # else, wait for the mission to be loaded
         if not stopped:
             # wait for a status change (STOPPED or LOADING)
             await self.wait_for_status_change([Status.STOPPED, Status.LOADING], timeout=120)
@@ -818,9 +857,23 @@ class ServerImpl(Server):
             await self.send_to_dcs({"command": "start_server"})
         # wait until we are running again
         await self.wait_for_status_change([Status.RUNNING, Status.PAUSED], timeout=300)
+        return True
 
-    async def loadNextMission(self, modify_mission: Optional[bool] = True) -> None:
-        await self.loadMission(int(self.settings['listStartIndex']) + 1, modify_mission)
+    async def loadNextMission(self, modify_mission: Optional[bool] = True) -> bool:
+        init_mission_id = int(self.settings['listStartIndex'])
+        max_mission_id = len(self.settings['missionList'])
+        mission_id = init_mission_id + 1
+        if mission_id > max_mission_id:
+            mission_id = 1
+        while not await self.loadMission(mission_id, modify_mission):
+            mission_id += 1
+            if mission_id > max_mission_id:
+                mission_id = 1
+            if mission_id == init_mission_id:
+                break
+        else:
+            return True
+        return False
 
     async def run_on_extension(self, extension: str, method: str, **kwargs) -> Any:
         ext = self.extensions.get(extension)
@@ -876,3 +929,7 @@ class ServerImpl(Server):
         await ext.uninstall()
         self.extensions.pop(name, None)
         await self.config_extension(name, {"enabled": False})
+
+    async def cleanup(self) -> None:
+        tempdir = os.path.join(tempfile.gettempdir(), self.instance.name)
+        await asyncio.to_thread(utils.safe_rmtree, tempdir)
